@@ -5,8 +5,7 @@ description = "Modular Google Maps scraper · Producer-Consumer architecture wit
 authors = ["Your Name <your.email@example.com>"]
 readme = "README.md"
 packages = [
-    { include = "src" },
-    { include = "config" },
+    { include = "backend" },
 ]
 
 [tool.poetry.dependencies]

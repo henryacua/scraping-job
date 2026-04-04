@@ -1,3 +1,4 @@
 -r requirements.txt
+-r requirements-render.txt
 pytest>=7.4.0
 pytest-asyncio>=0.23.0

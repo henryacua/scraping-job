@@ -1,10 +1,10 @@
-"""Tests para src/campaign.py — WhatsApp Cloud API con mock de aiohttp."""
+"""Tests para backend.app.services.campaign — WhatsApp Cloud API con mock de aiohttp."""
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from src.models import Business, BusinessStatus
-from src.campaign import WhatsAppCloudAPI, WhatsAppAPIError, CampaignStats
-from src.utils import normalize_phone
+from backend.app.models import Business
+from backend.app.services.campaign import WhatsAppAPIError, WhatsAppCloudAPI
+from backend.app.services.utils import normalize_phone
 
 
 # ── Tests para normalize_phone ──────────────────────────
@@ -98,7 +98,10 @@ class TestSendText:
             phone_number_id="12345",
         )
 
-        with patch("src.campaign.aiohttp.ClientSession", return_value=mock_session):
+        with patch(
+            "backend.app.services.campaign.aiohttp.ClientSession",
+            return_value=mock_session,
+        ):
             result = await client.send_text("573001112222", "Hola mundo")
 
         assert result == api_response
@@ -122,7 +125,10 @@ class TestSendText:
             phone_number_id="12345",
         )
 
-        with patch("src.campaign.aiohttp.ClientSession", return_value=mock_session):
+        with patch(
+            "backend.app.services.campaign.aiohttp.ClientSession",
+            return_value=mock_session,
+        ):
             with pytest.raises(WhatsAppAPIError) as exc_info:
                 await client.send_text("573001112222", "Hola")
 
@@ -146,7 +152,10 @@ class TestSendTemplate:
             phone_number_id="12345",
         )
 
-        with patch("src.campaign.aiohttp.ClientSession", return_value=mock_session):
+        with patch(
+            "backend.app.services.campaign.aiohttp.ClientSession",
+            return_value=mock_session,
+        ):
             result = await client.send_template(
                 "573001112222",
                 template_name="hello_world",
@@ -191,7 +200,10 @@ class TestSendBulk:
 
         client = WhatsAppCloudAPI(api_token="token", phone_number_id="12345")
 
-        with patch("src.campaign.aiohttp.ClientSession", return_value=mock_session):
+        with patch(
+            "backend.app.services.campaign.aiohttp.ClientSession",
+            return_value=mock_session,
+        ):
             stats = await client.send_bulk(
                 leads, "Hola {nombre}", mock_log_callback,
                 delay_min=0, delay_max=0,
@@ -215,7 +227,10 @@ class TestSendBulk:
 
         client = WhatsAppCloudAPI(api_token="token", phone_number_id="12345")
 
-        with patch("src.campaign.aiohttp.ClientSession", return_value=mock_session):
+        with patch(
+            "backend.app.services.campaign.aiohttp.ClientSession",
+            return_value=mock_session,
+        ):
             stats = await client.send_bulk(
                 leads, "Hola {nombre}", mock_log_callback,
                 use_template_mode=False,
@@ -237,7 +252,10 @@ class TestSendBulk:
 
         client = WhatsAppCloudAPI(api_token="token", phone_number_id="12345")
 
-        with patch("src.campaign.aiohttp.ClientSession", return_value=mock_session):
+        with patch(
+            "backend.app.services.campaign.aiohttp.ClientSession",
+            return_value=mock_session,
+        ):
             stats = await client.send_bulk(
                 leads, "Hola {nombre}", mock_log_callback,
                 delay_min=0, delay_max=0,

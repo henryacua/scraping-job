@@ -1,6 +1,6 @@
-"""Tests para src/models.py"""
+"""Tests para backend.app.models (SQLModel)."""
 import pytest
-from src.models import Business, BusinessStatus
+from backend.app.models import Business, BusinessStatus
 
 
 class TestBusinessStatus:
@@ -9,6 +9,7 @@ class TestBusinessStatus:
         assert BusinessStatus.PROCESSING.value == "PROCESSING"
         assert BusinessStatus.LEAD_QUALIFIED.value == "LEAD_QUALIFIED"
         assert BusinessStatus.HAS_WEBSITE.value == "HAS_WEBSITE"
+        assert BusinessStatus.FILTERED_OUT.value == "FILTERED_OUT"
         assert BusinessStatus.ERROR.value == "ERROR"
 
     def test_status_from_string(self):
@@ -25,7 +26,7 @@ class TestBusiness:
         biz = Business(name="Test Corp")
         assert biz.name == "Test Corp"
         assert biz.phone is None
-        assert biz.status == BusinessStatus.PENDING
+        assert biz.status == BusinessStatus.PENDING.value
 
     def test_create_full(self):
         biz = Business(
@@ -41,36 +42,25 @@ class TestBusiness:
         assert biz.phone == "+57 300 1234567"
         assert biz.website == "https://dental.com"
 
-    def test_to_dict(self):
-        biz = Business(name="Test", phone="123", status=BusinessStatus.LEAD_QUALIFIED)
-        d = biz.to_dict()
+    def test_model_dump(self):
+        biz = Business(
+            name="Test",
+            phone="123",
+            status=BusinessStatus.LEAD_QUALIFIED.value,
+        )
+        d = biz.model_dump()
         assert d["name"] == "Test"
         assert d["phone"] == "123"
         assert d["status"] == "LEAD_QUALIFIED"
 
-    def test_from_dict(self):
-        data = {
-            "id": 1,
-            "name": "Corp X",
-            "phone": "555",
-            "address": "Addr",
-            "website": "https://x.com",
-            "status": "HAS_WEBSITE",
-            "search_query": "test",
-            "rating": "3.0",
-            "reviews_count": "10",
-            "category": "Tech",
-            "created_at": "2024-01-01",
-            "updated_at": "2024-01-01",
-        }
-        biz = Business.from_dict(data)
-        assert biz.id == 1
-        assert biz.name == "Corp X"
-        assert biz.status == BusinessStatus.HAS_WEBSITE
-
-    def test_roundtrip(self):
-        biz = Business(name="Roundtrip", phone="999", status=BusinessStatus.ERROR)
-        restored = Business.from_dict(biz.to_dict())
+    def test_model_validate_roundtrip(self):
+        biz = Business(
+            name="Roundtrip",
+            phone="999",
+            status=BusinessStatus.ERROR.value,
+        )
+        d = biz.model_dump()
+        restored = Business.model_validate(d)
         assert restored.name == biz.name
         assert restored.phone == biz.phone
         assert restored.status == biz.status

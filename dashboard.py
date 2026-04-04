@@ -28,6 +28,10 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+# Mismo venv que uvicorn puede dejar instalada la policy de uvloop; Streamlit
+# corre en otro hilo y asyncio.get_event_loop() falla. Forzar loop estándar.
+asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+
 from backend.app.core.config import settings
 from backend.app.core.db import engine
 from backend.app import crud
@@ -38,18 +42,8 @@ from backend.app.services.strategies import AVAILABLE_STRATEGIES, get_strategy, 
 
 
 def run_async(coro):
-    """Ejecuta una coroutine de forma segura dentro de Streamlit."""
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                future = pool.submit(asyncio.run, coro)
-                return future.result()
-        else:
-            return loop.run_until_complete(coro)
-    except RuntimeError:
-        return asyncio.run(coro)
+    """Ejecuta una coroutine dentro del hilo de Streamlit (sin uvloop)."""
+    return asyncio.run(coro)
 
 
 async def _get_session():

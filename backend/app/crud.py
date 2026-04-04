@@ -10,8 +10,8 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional, Sequence
 
-from sqlalchemy import func, delete as sa_delete
-from sqlmodel import select
+from sqlalchemy import func
+from sqlmodel import delete, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from backend.app.models import Business, BusinessStatus, MessageLog
@@ -141,10 +141,10 @@ async def get_stats(
 
 
 async def delete_by_query(session: AsyncSession, search_query: str) -> int:
-    stmt = sa_delete(Business).where(Business.search_query == search_query)
-    result = await session.exec(stmt)  # type: ignore[arg-type]
+    stmt = delete(Business).where(Business.search_query == search_query)
+    result = await session.exec(stmt)
     await session.commit()
-    deleted = result.rowcount  # type: ignore[union-attr]
+    deleted = int(getattr(result, "rowcount", None) or 0)
     logger.info("Eliminados %d registros para query '%s'", deleted, search_query)
     return deleted
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
@@ -24,6 +25,22 @@ class Settings(BaseSettings):
     # Local/tests: sqlite+aiosqlite:///./queue.db
     # Supabase:    postgresql+asyncpg://user:pass@host:5432/postgres
     DATABASE_URL: str = f"sqlite+aiosqlite:///{_PROJECT_ROOT / 'queue.db'}"
+
+    # Solo desarrollo / redes con inspección SSL: no verificar cadena TLS (riesgo MITM).
+    DATABASE_SSL_INSECURE: bool = False
+
+    @field_validator("DATABASE_URL", mode="before")
+    @classmethod
+    def use_asyncpg_for_plain_postgresql(cls, v: object) -> object:
+        """Supabase/Render suelen pegar postgresql://; el engine async exige +asyncpg."""
+        if not isinstance(v, str):
+            return v
+        s = v.strip()
+        if s.startswith("postgres://"):
+            return "postgresql+asyncpg://" + s[len("postgres://") :]
+        if s.startswith("postgresql://") and not s.startswith("postgresql+"):
+            return "postgresql+asyncpg://" + s[len("postgresql://") :]
+        return s
 
     # Búsqueda
     SEARCH_QUERY: str = "Dentistas en Medellín"

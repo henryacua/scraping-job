@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse, Response
 
 from backend.app.api.routes import leads, scraping
 from backend.app.core.db import create_db_and_tables
@@ -37,6 +38,17 @@ app.add_middleware(
 
 app.include_router(scraping.router)
 app.include_router(leads.router)
+
+
+@app.get("/")
+async def root():
+    """Abrir http://localhost:8000/ en el navegador lleva a Swagger UI."""
+    return RedirectResponse(url="/docs")
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return Response(status_code=204)
 
 
 @app.get("/health")
