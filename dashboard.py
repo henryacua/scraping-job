@@ -1,34 +1,41 @@
 """
 dashboard.py — Centro de mando Streamlit para scraping-job-ms.
 
-Ejecutar con:
+Ejecución local:
     streamlit run dashboard.py
+
+Deploy en Streamlit Cloud:
+    - Conectar el repo de GitHub
+    - Configurar DATABASE_URL, RENDER_API_URL y API_KEY en Secrets
+
+Modos de operación:
+    - RENDER_API_URL configurada → llama al Worker en Render vía HTTP
+    - RENDER_API_URL vacía       → ejecuta scraping/procesamiento localmente
 """
 from __future__ import annotations
 
 import asyncio
 import sys
+import time
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
+import requests as _requests
 import streamlit as st
 
-# ── Asegurar que el directorio raíz esté en el path ────
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from config import settings
-from src.models import BusinessStatus
-from src.queue_manager import QueueManager
-from src.scraper import GoogleMapsScraper
-from src.processor import LeadProcessor
-from src.campaign import WhatsAppCloudAPI
-from src.utils import normalize_phone
-from src.strategies import AVAILABLE_STRATEGIES, get_strategy
+from backend.app.core.config import settings
+from backend.app.core.db import engine
+from backend.app import crud
+from backend.app.models import Business, BusinessStatus
+from backend.app.services.campaign import WhatsAppCloudAPI
+from backend.app.services.utils import normalize_phone
+from backend.app.services.strategies import AVAILABLE_STRATEGIES, get_strategy, get_all_strategies
 
-
-# ── Helpers para async dentro de Streamlit ──────────────
 
 def run_async(coro):
     """Ejecuta una coroutine de forma segura dentro de Streamlit."""
@@ -45,21 +52,79 @@ def run_async(coro):
         return asyncio.run(coro)
 
 
-def get_queue() -> QueueManager:
-    """Retorna el QueueManager singleton."""
-    return QueueManager(settings.DB_PATH)
+async def _get_session():
+    from sqlmodel.ext.asyncio.session import AsyncSession
+    return AsyncSession(engine)
 
 
-# ── Configuración de la página ──────────────────────────
+async def _init_db():
+    from backend.app.core.db import create_db_and_tables
+    await create_db_and_tables()
+
+
+async def _get_recent_queries():
+    async with AsyncSession(engine) as session:
+        return await crud.get_recent_queries(session)
+
+
+async def _get_stats(search_query):
+    async with AsyncSession(engine) as session:
+        return await crud.get_stats(session, search_query)
+
+
+async def _get_all_businesses(search_query):
+    async with AsyncSession(engine) as session:
+        return await crud.get_all_businesses(session, search_query)
+
+
+async def _get_message_logs():
+    async with AsyncSession(engine) as session:
+        return await crud.get_message_logs(session)
+
+
+async def _delete_by_query(search_query):
+    async with AsyncSession(engine) as session:
+        return await crud.delete_by_query(session, search_query)
+
+
+async def _log_message(bid, status, tmpl):
+    async with AsyncSession(engine) as session:
+        return await crud.log_message(session, bid, status, tmpl)
+
+
+from sqlmodel.ext.asyncio.session import AsyncSession
+
+
+def _api_headers() -> dict:
+    headers = {}
+    if settings.API_KEY:
+        headers["x-api-key"] = settings.API_KEY
+    return headers
+
+
+def _poll_job(job_id: str, status_widget) -> dict:
+    url = f"{settings.RENDER_API_URL}/jobs/{job_id}"
+    for _ in range(120):
+        time.sleep(3)
+        try:
+            resp = _requests.get(url, headers=_api_headers(), timeout=10)
+            job = resp.json()
+            status_widget.write(f"Estado: **{job.get('status', '...')}**")
+            if job.get("status") in ("completed", "failed"):
+                return job
+        except Exception as exc:
+            status_widget.write(f"Esperando respuesta... ({exc})")
+    return {"status": "failed", "error": "Timeout esperando al worker"}
+
+
+# ── Configuración de página ───────────────────────────────
 
 st.set_page_config(
-    page_title="🕷️ Scraping Job MS",
+    page_title="Scraping Job MS",
     page_icon="🕷️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
-
-# ── CSS personalizado ───────────────────────────────────
 
 st.markdown("""
 <style>
@@ -67,13 +132,10 @@ st.markdown("""
         background: radial-gradient(circle at 10% 20%, #1a1a2e 0%, #16213e 90%);
         color: #e0e0e0;
     }
-
     [data-testid="stSidebar"] {
         background: #0f3460;
         border-right: 1px solid rgba(255,255,255,0.05);
     }
-
-    /* KPI Cards Responsive Grid */
     .kpi-card {
         background: rgba(255, 255, 255, 0.05);
         backdrop-filter: blur(12px);
@@ -106,13 +168,7 @@ st.markdown("""
         letter-spacing: 0.05em;
         font-weight: 500;
     }
-
-    /* Table Styling */
-    .dataframe {
-        font-size: 0.9rem !important;
-        width: 100% !important;
-    }
-    /* Contenedor para scroll horizontal en móviles */
+    .dataframe { font-size: 0.9rem !important; width: 100% !important; }
     .table-container {
         overflow-x: auto;
         -webkit-overflow-scrolling: touch;
@@ -120,8 +176,6 @@ st.markdown("""
         border-radius: 8px;
         border: 1px solid rgba(255,255,255,0.1);
     }
-
-    /* Status Badges */
     .status-badge {
         padding: 4px 8px;
         border-radius: 6px;
@@ -129,69 +183,60 @@ st.markdown("""
         font-weight: 600;
         white-space: nowrap;
     }
-    .status-pending { background: rgba(108, 117, 125, 0.3); color: #e9ecef; border: 1px solid rgba(108, 117, 125, 0.5); }
-    .status-qualified { background: rgba(40, 167, 69, 0.2); color: #2ecc71; border: 1px solid rgba(40, 167, 69, 0.4); }
-    .status-has-website { background: rgba(0, 123, 255, 0.2); color: #5dade2; border: 1px solid rgba(0, 123, 255, 0.4); }
-    .status-error { background: rgba(220, 53, 69, 0.2); color: #ec7063; border: 1px solid rgba(220, 53, 69, 0.4); }
-    .status-processing { background: rgba(111, 66, 193, 0.2); color: #d7bde2; border: 1px solid rgba(111, 66, 193, 0.4); }
-
-    /* Action Buttons */
+    .status-pending   { background: rgba(108,117,125,0.3); color:#e9ecef; border:1px solid rgba(108,117,125,0.5); }
+    .status-qualified { background: rgba(40,167,69,0.2);  color:#2ecc71; border:1px solid rgba(40,167,69,0.4);  }
+    .status-has-website { background: rgba(0,123,255,0.2); color:#5dade2; border:1px solid rgba(0,123,255,0.4); }
+    .status-error     { background: rgba(220,53,69,0.2);  color:#ec7063; border:1px solid rgba(220,53,69,0.4);  }
+    .status-processing { background: rgba(111,66,193,0.2); color:#d7bde2; border:1px solid rgba(111,66,193,0.4); }
     .wa-btn {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        background: linear-gradient(135deg, #25D366, #128C7E);
-        color: white !important;
-        text-decoration: none !important;
-        padding: 6px 12px;
-        border-radius: 20px;
-        font-size: 0.8rem;
-        font-weight: 600;
-        transition: transform 0.2s, box-shadow 0.2s;
+        display: inline-flex; align-items: center; gap: 6px;
+        background: linear-gradient(135deg,#25D366,#128C7E);
+        color: white !important; text-decoration: none !important;
+        padding: 6px 12px; border-radius: 20px; font-size: 0.8rem;
+        font-weight: 600; transition: transform 0.2s, box-shadow 0.2s;
         box-shadow: 0 2px 4px rgba(0,0,0,0.2);
     }
-    .wa-btn:hover {
-        transform: scale(1.05);
-        box-shadow: 0 4px 8px rgba(37, 211, 102, 0.4);
-        color: white !important;
-    }
-
+    .wa-btn:hover { transform:scale(1.05); box-shadow:0 4px 8px rgba(37,211,102,0.4); color:white !important; }
     .header-title {
-        font-size: 2.2rem;
-        font-weight: 800;
-        background: linear-gradient(to right, #ffffff, #a5a5a5);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
+        font-size: 2.2rem; font-weight: 800;
+        background: linear-gradient(to right,#ffffff,#a5a5a5);
+        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
         margin-bottom: 0.2rem;
     }
-    .header-subtitle {
-        color: #8899a6;
-        font-size: 1rem;
-        font-weight: 400;
-        margin-top: 0;
+    .header-subtitle { color:#8899a6; font-size:1rem; font-weight:400; margin-top:0; }
+    .mode-badge {
+        display: inline-block; padding: 3px 10px; border-radius: 20px;
+        font-size: 0.72rem; font-weight: 600;
     }
+    .mode-remote { background: rgba(0,210,255,0.15); color:#00d2ff; border:1px solid rgba(0,210,255,0.3); }
+    .mode-local  { background: rgba(255,193,7,0.15);  color:#ffc107; border:1px solid rgba(255,193,7,0.3); }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Header ──────────────────────────────────────────────
+# ── Header ────────────────────────────────────────────────
+
+remote_mode = bool(settings.RENDER_API_URL)
+mode_label = "Render (remoto)" if remote_mode else "Local"
+mode_class = "mode-remote" if remote_mode else "mode-local"
 
 st.markdown('<p class="header-title">🕷️ Scraping Job MS</p>', unsafe_allow_html=True)
-st.markdown('<p class="header-subtitle">Google Maps Lead Scraper · Producer-Consumer Dashboard</p>', unsafe_allow_html=True)
+st.markdown(
+    f'<p class="header-subtitle">Google Maps Lead Scraper &nbsp;·&nbsp; '
+    f'<span class="mode-badge {mode_class}">Worker: {mode_label}</span></p>',
+    unsafe_allow_html=True,
+)
 st.markdown("---")
 
-# ── Inicializar DB (antes del sidebar para poder consultar búsquedas recientes) ──
+# ── Inicializar DB ────────────────────────────────────────
 
-queue = get_queue()
-run_async(queue.initialize())
+run_async(_init_db())
+recent_queries = run_async(_get_recent_queries())
 
-recent_queries = run_async(queue.get_recent_queries())
-
-# ── Sidebar: Controles ──────────────────────────────────
+# ── Sidebar ───────────────────────────────────────────────
 
 with st.sidebar:
     st.markdown("## ⚙️ Configuración")
 
-    # Búsquedas recientes como dropdown
     if recent_queries:
         selected_recent = st.selectbox(
             "🕐 Búsquedas recientes",
@@ -202,26 +247,16 @@ with st.sidebar:
     else:
         use_recent = False
 
-    # Campos de búsqueda nueva
     if not use_recent:
         col_svc, col_city = st.columns([3, 2])
         with col_svc:
-            search_service = st.text_input(
-                "🏢 Servicio / Negocio",
-                value="Dentistas",
-                placeholder="Ej: Abogados, Restaurantes...",
-            )
+            search_service = st.text_input("🏢 Servicio / Negocio", value="Dentistas", placeholder="Ej: Abogados...")
         with col_city:
-            search_city = st.text_input(
-                "📍 Ciudad",
-                value="Medellín",
-                placeholder="Ej: Bogotá, Cali...",
-            )
+            search_city = st.text_input("📍 Ciudad", value="Medellín", placeholder="Ej: Bogotá...")
         search_query = f"{search_service} en {search_city}" if search_service and search_city else ""
     else:
         search_query = selected_recent
 
-    # Mostrar la query compuesta
     if search_query:
         st.caption(f"🔎 Búsqueda: **{search_query}**")
 
@@ -235,7 +270,6 @@ with st.sidebar:
     st.markdown("## 🚀 Ejecución")
 
     col_a, col_b = st.columns(2)
-
     with col_a:
         btn_scrape = st.button("🔍 Buscar (Scrape)", use_container_width=True, type="primary")
     with col_b:
@@ -243,30 +277,89 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("## 📊 Opciones")
-
     headless = st.checkbox("🖥️ Modo Headless", value=True)
     max_scrolls = st.slider("📜 Máx. Scrolls", min_value=5, max_value=50, value=20)
 
     st.markdown("---")
     st.markdown(
-        "<div style='text-align:center; color: rgba(255,255,255,0.3); font-size: 0.75rem;'>"
-        "scraping-job-ms v0.1.0</div>",
+        "<div style='text-align:center;color:rgba(255,255,255,0.3);font-size:0.75rem;'>"
+        "scraping-job-ms v0.2.0</div>",
         unsafe_allow_html=True,
     )
 
 
+# ── Acciones: modo remoto (Render API) ───────────────────
 
-# ── Funciones de acción ─────────────────────────────────
+def action_scrape_remote():
+    try:
+        resp = _requests.post(
+            f"{settings.RENDER_API_URL}/scrape",
+            json={"query": search_query, "max_scrolls": max_scrolls, "headless": headless},
+            headers=_api_headers(),
+            timeout=15,
+        )
+        resp.raise_for_status()
+    except Exception as exc:
+        st.error(f"No se pudo contactar el Worker en Render: {exc}")
+        return
 
-def action_scrape():
-    """Ejecuta el Producer (scraper) siempre desde cero para esta búsqueda."""
-    # Verificar si ya existen datos para esta búsqueda
-    existing = run_async(queue.get_all_businesses(search_query))
+    job = resp.json()
+    job_id = job["job_id"]
 
+    with st.status("Ejecutando scraping en Render...", expanded=True) as status_widget:
+        log_area = st.empty()
+        result = _poll_job(job_id, log_area)
+        if result.get("status") == "completed":
+            count = result.get("businesses_found", "?")
+            status_widget.update(label=f"Scraping completado: {count} negocios", state="complete")
+            st.success(f"Se encontraron **{count}** negocios para *\"{search_query}\"*")
+            st.rerun()
+        else:
+            status_widget.update(label="Error en scraping", state="error")
+            st.error(f"El job fallo: {result.get('error', 'Error desconocido')}")
+
+
+def action_process_remote():
+    try:
+        resp = _requests.post(
+            f"{settings.RENDER_API_URL}/process",
+            json={"batch_size": settings.BATCH_SIZE},
+            headers=_api_headers(),
+            timeout=15,
+        )
+        resp.raise_for_status()
+    except Exception as exc:
+        st.error(f"No se pudo contactar el Worker en Render: {exc}")
+        return
+
+    job = resp.json()
+    job_id = job["job_id"]
+
+    with st.status("Procesando leads en Render...", expanded=True) as status_widget:
+        log_area = st.empty()
+        result = _poll_job(job_id, log_area)
+        if result.get("status") == "completed":
+            r = result.get("results", {})
+            status_widget.update(label="Procesamiento completado", state="complete")
+            st.success(
+                f"**{r.get('passed', 0)}** leads cualificados · "
+                f"**{r.get('filtered_out', 0)}** filtrados · "
+                f"**{r.get('errors', 0)}** errores"
+            )
+        else:
+            status_widget.update(label="Error en procesamiento", state="error")
+            st.error(f"El job fallo: {result.get('error', 'Error desconocido')}")
+
+
+# ── Acciones: modo local ──────────────────────────────────
+
+def action_scrape_local():
+    from backend.app.services.scraper import GoogleMapsScraper
+
+    existing = run_async(_get_all_businesses(search_query))
     if existing:
-        deleted = run_async(queue.delete_by_query(search_query))
-        # st.info(f"🗑️ Limpiando {deleted} registros anteriores...")
-    
+        run_async(_delete_by_query(search_query))
+
     log_container = st.empty()
     logs: list[str] = []
 
@@ -275,29 +368,29 @@ def action_scrape():
         log_container.code("\n".join(logs[-10:]), language="text")
 
     progress_bar = st.progress(0, text="Iniciando scraping...")
-
     try:
-        scraper = GoogleMapsScraper(
-            queue,
-            headless=headless,
-            max_scrolls=max_scrolls,
-            on_progress=on_progress,
-        )
-        count = run_async(scraper.run(search_query))
+        async def _do_scrape():
+            async with AsyncSession(engine) as session:
+                scraper = GoogleMapsScraper(
+                    session,
+                    headless=headless,
+                    max_scrolls=max_scrolls,
+                    on_progress=on_progress,
+                )
+                return await scraper.run(search_query)
+
+        count = run_async(_do_scrape())
         progress_bar.progress(100, text=f"✅ {count} negocios encontrados")
-        st.success(f"Scraping completado: **{count}** negocios extraídos para *\"{search_query}\"*")
-        st.rerun() # Recargar para mostrar datos nuevos
-    except Exception as e:
+        st.success(f"Scraping completado: **{count}** negocios para *\"{search_query}\"*")
+        st.rerun()
+    except Exception as exc:
         progress_bar.progress(0, text="❌ Error")
-        st.error(f"Error durante el scraping: {e}")
+        st.error(f"Error durante el scraping: {exc}")
 
 
+def action_process_local():
+    from backend.app.services.processor import LeadProcessor
 
-
-
-
-def action_process():
-    """Ejecuta el Consumer (procesador de leads)."""
     log_container = st.empty()
     logs: list[str] = []
 
@@ -306,193 +399,172 @@ def action_process():
         log_container.code("\n".join(logs[-30:]), language="text")
 
     progress_bar = st.progress(0, text="Procesando leads...")
-
     try:
-        strategy = get_strategy(strategy_name)
-        processor = LeadProcessor(queue, strategy, on_progress=on_progress)
-        results = run_async(processor.run())
+        async def _do_process():
+            async with AsyncSession(engine) as session:
+                actions = get_all_strategies()
+                processor = LeadProcessor(session, actions, on_progress=on_progress)
+                return await processor.run()
+
+        results = run_async(_do_process())
         progress_bar.progress(100, text="✅ Procesamiento completo")
         st.success(
-            f"Procesamiento completo: **{results['leads_qualified']}** leads cualificados, "
-            f"**{results['has_website']}** con web, "
+            f"**{results['passed']}** leads cualificados · "
+            f"**{results['filtered_out']}** filtrados · "
             f"**{results['errors']}** errores"
         )
-    except Exception as e:
+    except Exception as exc:
         progress_bar.progress(100, text="❌ Error")
-        st.error(f"Error durante el procesamiento: {e}")
+        st.error(f"Error durante el procesamiento: {exc}")
 
 
-# ── Disparar acciones ───────────────────────────────────
+# ── Despachar acciones ────────────────────────────────────
 
 if btn_scrape:
-    with st.spinner("Ejecutando scraping..."):
-        action_scrape()
+    with st.spinner("Iniciando..."):
+        if remote_mode:
+            action_scrape_remote()
+        else:
+            action_scrape_local()
 
 if btn_process:
-    with st.spinner("Procesando leads..."):
-        action_process()
+    with st.spinner("Iniciando..."):
+        if remote_mode:
+            action_process_remote()
+        else:
+            action_process_local()
 
 
-# ── KPIs ────────────────────────────────────────────────
+# ── KPIs ──────────────────────────────────────────────────
 
 st.markdown("## 📈 Métricas")
 
-stats = run_async(queue.get_stats(search_query))
+stats = run_async(_get_stats(search_query))
 
 total = stats.get("TOTAL", 0)
-leads = stats.get("LEAD_QUALIFIED", 0)
+leads_count = stats.get("LEAD_QUALIFIED", 0)
 has_web = stats.get("HAS_WEBSITE", 0)
 pending = stats.get("PENDING", 0)
-errors = stats.get("ERROR", 0)
-conversion = (leads / total * 100) if total > 0 else 0
+conversion = (leads_count / total * 100) if total > 0 else 0
 
 kpi_cols = st.columns(5)
-
 kpi_data = [
     ("🔎", total, "Total Encontrados"),
-    ("🟢", leads, "Leads Cualificados"),
+    ("🟢", leads_count, "Leads Cualificados"),
     ("🔵", has_web, "Con Sitio Web"),
     ("⏳", pending, "Pendientes"),
     ("📊", f"{conversion:.1f}%", "Tasa de Conversión"),
 ]
-
 for col, (icon, value, label) in zip(kpi_cols, kpi_data):
     with col:
         st.markdown(
-            f"""
-            <div class="kpi-card">
-                <div style="font-size: 1.5rem;">{icon}</div>
-                <p class="kpi-value">{value}</p>
-                <p class="kpi-label">{label}</p>
-            </div>
-            """,
+            f'<div class="kpi-card">'
+            f'<div style="font-size:1.5rem;">{icon}</div>'
+            f'<p class="kpi-value">{value}</p>'
+            f'<p class="kpi-label">{label}</p>'
+            f'</div>',
             unsafe_allow_html=True,
         )
 
 st.markdown("<br>", unsafe_allow_html=True)
 
 
-# ── Data Grid ───────────────────────────────────────────
-
-# ── Data Grid ───────────────────────────────────────────
+# ── Data Grid ─────────────────────────────────────────────
 
 st.markdown("## 📋 Negocios Encontrados")
 
-businesses = run_async(queue.get_all_businesses(search_query))
+businesses = run_async(_get_all_businesses(search_query))
 
 if businesses:
-    df = pd.DataFrame([b.to_dict() for b in businesses])
-    
-    # ── Controles Principales (Fila única) ──
-    # Orden: Buscador -> Filtro Estado -> Ordenar
-    c_search, c_filter, c_sort, c_order = st.columns([2, 1.5, 1.5, 1])
+    def _biz_to_dict(b: Business) -> dict:
+        return {
+            "id": b.id,
+            "name": b.name,
+            "phone": b.phone,
+            "address": b.address,
+            "website": b.website,
+            "email": b.email,
+            "status": b.status,
+            "search_query": b.search_query,
+            "rating": b.rating,
+            "reviews_count": b.reviews_count,
+            "category": b.category,
+            "filter_reason": b.filter_reason,
+            "created_at": str(b.created_at),
+            "updated_at": str(b.updated_at),
+        }
 
+    df = pd.DataFrame([_biz_to_dict(b) for b in businesses])
+
+    c_search, c_filter, c_sort, c_order = st.columns([2, 1.5, 1.5, 1])
     with c_search:
         search_name = st.text_input("Buscar por nombre", value="", placeholder="Escribe para filtrar...")
-        
     with c_filter:
         status_filter = st.multiselect(
-            "Estado",
-            options=[s.value for s in BusinessStatus],
-            default=[],
-            placeholder="Todos"
+            "Estado", options=[s.value for s in BusinessStatus], default=[], placeholder="Todos"
         )
-        
     with c_sort:
         sort_col = st.selectbox(
             "Ordenar por",
             options=["name", "rating", "reviews_count", "status", "category"],
-            format_func=lambda x: {
-                "name": "Nombre",
-                "rating": "Rating",
-                "reviews_count": "Reseñas",
-                "status": "Estado",
-                "category": "Categoría"
-            }.get(x, x),
-            index=1
-        )
-        
-    with c_order:
-        st.write("") # Spacer para alinear verticalmente con inputs
-        st.write("")
-        sort_asc = st.radio(
-            "Dirección",
-            options=["Asc", "Desc"],
+            format_func=lambda x: {"name":"Nombre","rating":"Rating","reviews_count":"Reseñas","status":"Estado","category":"Categoría"}.get(x, x),
             index=1,
-            horizontal=True,
-            label_visibility="collapsed"
         )
+    with c_order:
+        st.write("")
+        st.write("")
+        sort_asc = st.radio("Dirección", options=["Asc", "Desc"], index=1, horizontal=True, label_visibility="collapsed")
 
-    # ── Aplicar Lógica ──
     df_filtered = df.copy()
-    
-    # 1. Filtros
     if status_filter:
         df_filtered = df_filtered[df_filtered["status"].isin(status_filter)]
     if search_name:
-        df_filtered = df_filtered[
-            df_filtered["name"].str.contains(search_name, case=False, na=False)
-        ]
-        
-    # 2. Orden
+        df_filtered = df_filtered[df_filtered["name"].str.contains(search_name, case=False, na=False)]
     if sort_col:
         ascending = sort_asc == "Asc"
         if sort_col in ["rating", "reviews_count"]:
-             df_filtered[sort_col] = pd.to_numeric(df_filtered[sort_col], errors='coerce')
+            df_filtered[sort_col] = pd.to_numeric(df_filtered[sort_col], errors="coerce")
         df_filtered = df_filtered.sort_values(by=sort_col, ascending=ascending)
 
-    st.markdown("---") 
-    
-    # ── Sección de Campaña (Separada para claridad) ──
+    st.markdown("---")
+
+    # ── Sección campaña WhatsApp ──
     with st.container():
-        # Verificar si la API está configurada
         wa_client = WhatsAppCloudAPI()
         api_configured = wa_client.is_configured
 
         if not api_configured:
             st.warning(
                 "⚠️ **WhatsApp API no configurada.** "
-                "Agrega `WA_API_TOKEN` y `WA_PHONE_NUMBER_ID` en tu archivo `.env` "
+                "Agrega `WA_API_TOKEN` y `WA_PHONE_NUMBER_ID` en tu `.env` "
                 "para habilitar campañas masivas. "
                 "[Obtener credenciales →](https://developers.facebook.com)"
             )
 
         c_mode, c_msg_input = st.columns([1, 3])
-
         with c_mode:
             wa_mode = st.radio(
-                "Modo de envío",
-                options=["Template", "Texto libre"],
-                index=0,
-                help="Template: usa un template aprobado por Meta (puede iniciar conversaciones). "
-                     "Texto libre: solo funciona si el destinatario ya te escribió."
+                "Modo de envío", options=["Template", "Texto libre"], index=0,
+                help="Template: usa un template aprobado por Meta. Texto libre: solo si el destinatario ya escribió."
             )
             use_template_mode = wa_mode == "Template"
 
         with c_msg_input:
             if use_template_mode:
-                wa_template_name = st.text_input(
-                    "📋 Nombre del Template",
-                    value=settings.WA_TEMPLATE_NAME,
-                    help="Nombre exacto del template aprobado en Meta Business Manager."
-                )
-                wa_template_lang = st.text_input(
-                    "🌐 Idioma del Template",
-                    value=settings.WA_TEMPLATE_LANG,
-                )
+                wa_template_name = st.text_input("📋 Nombre del Template", value=settings.WA_TEMPLATE_NAME)
+                wa_template_lang = st.text_input("🌐 Idioma del Template", value=settings.WA_TEMPLATE_LANG)
                 wa_template = f"[Template: {wa_template_name}]"
             else:
                 wa_template = st.text_area(
                     "💬 Mensaje para Campaña WhatsApp",
-                    value="Hola {nombre}, vi que no tienes sitio web y puedo ayudarte a crear uno increíble para tu negocio.",
+                    value="Hola {nombre}, vi que no tienes sitio web y puedo ayudarte.",
                     height=100,
-                    help="Usa {nombre} para insertar el nombre del negocio automáticamente."
+                    help="Usa {nombre} para insertar el nombre del negocio automáticamente.",
                 )
                 wa_template_name = settings.WA_TEMPLATE_NAME
                 wa_template_lang = settings.WA_TEMPLATE_LANG
 
-        # ── Botón de Campaña Masiva ──
-        campaign_logs = run_async(queue.get_message_logs())
+        campaign_logs = run_async(_get_message_logs())
         sent_ids = {bid for bid, status in campaign_logs.items() if status == "SENT"}
         pending_leads_df = df_filtered[~df_filtered["id"].isin(sent_ids)]
         count_pending = len(pending_leads_df)
@@ -504,14 +576,14 @@ if businesses:
 
                 campaign_prog = st.status("🚀 Ejecutando campaña...", expanded=True)
                 log_box = st.empty()
-                logs = []
+                log_lines: list[str] = []
 
-                def on_campaign_progress(msg):
-                    logs.append(msg)
-                    log_box.code("\n".join(logs[-10:]), language="text")
+                def on_campaign_progress(msg: str):
+                    log_lines.append(msg)
+                    log_box.code("\n".join(log_lines[-10:]), language="text")
 
                 async def persist_log(bid, status, tmpl):
-                    await queue.log_message(bid, status, tmpl)
+                    await _log_message(bid, status, tmpl)
 
                 async def run_campaign_flow():
                     client = WhatsAppCloudAPI(on_progress=on_campaign_progress)
@@ -525,54 +597,40 @@ if businesses:
                     )
 
                 try:
-                    stats = run_async(run_campaign_flow())
+                    campaign_stats = run_async(run_campaign_flow())
                     campaign_prog.update(label="✅ Campaña finalizada!", state="complete", expanded=False)
-                    st.success(f"Resultados: {stats.sent} enviados, {stats.failed} fallidos, {stats.skipped} saltados.")
+                    st.success(f"Resultados: {campaign_stats.sent} enviados, {campaign_stats.failed} fallidos, {campaign_stats.skipped} saltados.")
                     st.rerun()
-                except Exception as e:
+                except Exception as exc:
                     campaign_prog.update(label="❌ Error en campaña", state="error")
-                    st.error(f"Error crítico: {e}")
+                    st.error(f"Error crítico: {exc}")
         elif count_pending == 0:
             st.info("✅ Todos contactados")
 
     st.markdown(f"**Viendo {len(df_filtered)} de {len(df)} registros**")
 
-
-    # ── Preparar Display ──
-    # Añadimos estado de campaña al DF
+    # ── Tabla ──
     def get_campaign_status(row):
         return campaign_logs.get(row["id"], "—")
-    
+
+    df_filtered = df_filtered.copy()
     df_filtered["campaign_status"] = df_filtered.apply(get_campaign_status, axis=1)
 
-    # Columnas a mostrar
     display_cols = ["name", "phone", "email", "campaign_status", "address", "website", "status", "category", "rating"]
     display_cols = [c for c in display_cols if c in df_filtered.columns]
-    
-    # Trabajamos sobre una copia para formatear
     df_display = df_filtered[display_cols].copy()
 
-    # Renombrar columnas al español
     col_rename = {
-        "name": "Nombre",
-        "phone": "Teléfono",
-        "email": "Email",
-        "campaign_status": "Estado Campaña",
-        "address": "Dirección",
-        "website": "Sitio Web",
-        "status": "Estado",
-        "category": "Categoría",
-        "rating": "Rating",
+        "name": "Nombre", "phone": "Teléfono", "email": "Email",
+        "campaign_status": "Estado Campaña", "address": "Dirección",
+        "website": "Sitio Web", "status": "Estado", "category": "Categoría", "rating": "Rating",
     }
     df_display = df_display.rename(columns=col_rename)
 
-    # Colorear estados
     def style_status(val):
         status_map = {
-            "PENDING": "status-pending",
-            "PROCESSING": "status-processing",
-            "LEAD_QUALIFIED": "status-qualified",
-            "HAS_WEBSITE": "status-has-website",
+            "PENDING": "status-pending", "PROCESSING": "status-processing",
+            "LEAD_QUALIFIED": "status-qualified", "HAS_WEBSITE": "status-has-website",
             "ERROR": "status-error",
         }
         css_class = status_map.get(val, "status-pending")
@@ -581,58 +639,39 @@ if businesses:
     def style_campaign(val):
         if val == "SENT":
             return '<span class="status-badge status-qualified">✅ Enviado</span>'
-        elif val == "FAILED" or "FAILED" in str(val):
+        elif "FAILED" in str(val):
             return '<span class="status-badge status-error">❌ Fallido</span>'
         elif val == "SKIPPED":
             return '<span class="status-badge status-pending">⏭️ Saltado</span>'
-        else:
-            return '<span style="color:rgba(255,255,255,0.3);">—</span>'
+        return '<span style="color:rgba(255,255,255,0.3);">—</span>'
 
     if "Estado" in df_display.columns:
         df_display["Estado"] = df_display["Estado"].apply(style_status)
-    
     if "Estado Campaña" in df_display.columns:
         df_display["Estado Campaña"] = df_display["Estado Campaña"].apply(style_campaign)
-
-    # Reemplazar NaN
     df_display = df_display.fillna("—")
 
-    # ── Agregar Columna de Acción (WhatsApp Individual) ──
     def create_wa_link(row):
         status = campaign_logs.get(row["id"])
         if status == "SENT":
             return '<span style="font-size:1.2rem;">✅</span>'
-
         phone_clean = normalize_phone(str(row.get("phone", "")))
         name = str(row.get("name", ""))
-
         if not phone_clean:
             return "—"
-
         from urllib.parse import quote
         msg_text = wa_template.replace("{nombre}", name) if "{nombre}" in wa_template else wa_template
-        encoded_msg = quote(msg_text)
-
-        url = f"https://wa.me/{phone_clean}?text={encoded_msg}"
-
+        url = f"https://wa.me/{phone_clean}?text={quote(msg_text)}"
         return f'<a href="{url}" target="_blank" class="wa-btn"><span>📲</span> Enviar</a>'
 
     df_display["Acción"] = df_filtered.apply(create_wa_link, axis=1)
 
-    # ── Renderizar Tabla con Container Responsivo ──
     st.markdown(
-        f"""
-        <div class="table-container">
-            {df_display.to_html(escape=False, index=False, classes="dataframe")}
-        </div>
-        """,
+        f'<div class="table-container">{df_display.to_html(escape=False, index=False, classes="dataframe")}</div>',
         unsafe_allow_html=True,
     )
-
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # ── Botón de Exportación (Ahora abajo de la tabla filtrada o arriba si prefieres) ──
-    # El usuario pidió "interactuar con la ya renderizada", ponerlo cerca es lo mejor.
     csv_data = df_filtered.to_csv(index=False, encoding="utf-8")
     st.download_button(
         label="📥 Descargar CSV (Filtrado)",

@@ -16,19 +16,26 @@ import argparse
 import asyncio
 import sys
 
-from config import settings
-from src.queue_manager import QueueManager
-from src.scraper import GoogleMapsScraper
-from src.processor import LeadProcessor
-from src.strategies import get_strategy, get_all_strategies, AVAILABLE_STRATEGIES
-from src.utils import setup_logger
+from backend.app.core.config import settings
+from backend.app.core.db import create_db_and_tables, engine
+from backend.app import crud
+from backend.app.services.scraper import GoogleMapsScraper
+from backend.app.services.processor import LeadProcessor
+from backend.app.services.strategies import (
+    AVAILABLE_STRATEGIES,
+    get_all_strategies,
+    get_strategy,
+)
+from backend.app.services.utils import setup_logger
+
+from sqlmodel.ext.asyncio.session import AsyncSession
 
 logger = setup_logger("main")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="🕷️ scraping-job-ms — Google Maps Lead Scraper",
+        description="scraping-job-ms — Google Maps Lead Scraper",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Ejemplos:
@@ -79,12 +86,8 @@ Ejemplos:
 
 
 async def async_main(args: argparse.Namespace) -> None:
-    """Pipeline principal async."""
-    # Inicializar cola
-    queue = QueueManager(settings.DB_PATH)
-    await queue.initialize()
+    await create_db_and_tables()
 
-    # Construir lista de acciones
     if args.actions is not None:
         actions = [get_strategy(name) for name in args.actions]
     else:
@@ -93,50 +96,48 @@ async def async_main(args: argparse.Namespace) -> None:
     action_names = ", ".join(a.name for a in actions)
     logger.info("Acciones seleccionadas: %s", action_names)
 
-    # ── Fase 1: Scraping ──────────────────
-    if not args.process_only:
-        logger.info("=" * 60)
-        logger.info("FASE 1: SCRAPING (Producer)")
-        logger.info("=" * 60)
+    async with AsyncSession(engine) as session:
+        if not args.process_only:
+            logger.info("=" * 60)
+            logger.info("FASE 1: SCRAPING (Producer)")
+            logger.info("=" * 60)
 
-        scraper = GoogleMapsScraper(
-            queue,
-            headless=not args.no_headless,
-            max_scrolls=args.max_scrolls,
-        )
-        count = await scraper.run(args.query)
-        logger.info("Scraping finalizado: %d negocios extraídos", count)
+            scraper = GoogleMapsScraper(
+                session,
+                headless=not args.no_headless,
+                max_scrolls=args.max_scrolls,
+            )
+            count = await scraper.run(args.query)
+            logger.info("Scraping finalizado: %d negocios extraidos", count)
 
-    # ── Fase 2: Procesamiento ─────────────
-    if not args.scrape_only:
+        if not args.scrape_only:
+            logger.info("=" * 60)
+            logger.info("FASE 2: PROCESAMIENTO (Consumer)")
+            logger.info("=" * 60)
+
+            processor = LeadProcessor(session, actions)
+            results = await processor.run()
+            logger.info("Procesamiento finalizado: %s", results)
+
+        stats = await crud.get_stats(session)
         logger.info("=" * 60)
-        logger.info("FASE 2: PROCESAMIENTO (Consumer)")
+        logger.info("RESUMEN FINAL")
         logger.info("=" * 60)
-
-        processor = LeadProcessor(queue, actions)
-        results = await processor.run()
-        logger.info("Procesamiento finalizado: %s", results)
-
-    # ── Resumen final ─────────────────────
-    stats = await queue.get_stats()
-    logger.info("=" * 60)
-    logger.info("RESUMEN FINAL")
-    logger.info("=" * 60)
-    for status, count in sorted(stats.items()):
-        logger.info("  %-20s: %d", status, count)
+        for status, count in sorted(stats.items()):
+            logger.info("  %-20s: %s", status, count)
 
 
 def main() -> None:
     args = parse_args()
 
     if args.scrape_only and args.process_only:
-        print("❌ Error: No se puede usar --scrape-only y --process-only juntos.")
+        print("Error: No se puede usar --scrape-only y --process-only juntos.")
         sys.exit(1)
 
     try:
         asyncio.run(async_main(args))
     except KeyboardInterrupt:
-        logger.info("\n⛔ Proceso interrumpido por el usuario")
+        logger.info("Proceso interrumpido por el usuario")
         sys.exit(0)
     except Exception as e:
         logger.error("Error fatal: %s", e, exc_info=True)

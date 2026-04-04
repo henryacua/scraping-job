@@ -1,4 +1,10 @@
-"""Tests para src/queue_manager.py — usa SQLite in-memory."""
+"""
+Tests para src/queue_manager.py — usa SQLite via backend automático.
+
+El QueueManager detecta el prefijo del database_url:
+- ruta de archivo o sqlite:/// → aiosqlite (SQLite) ← usado aquí en tests
+- postgresql:// → asyncpg (Postgres) ← usado en producción con Supabase
+"""
 import pytest
 from src.models import Business, BusinessStatus
 from src.queue_manager import QueueManager
@@ -6,7 +12,7 @@ from src.queue_manager import QueueManager
 
 @pytest.fixture
 async def queue(tmp_path):
-    """Crea un QueueManager con DB temporal."""
+    """Crea un QueueManager con DB SQLite temporal."""
     db_path = str(tmp_path / "test_queue.db")
     qm = QueueManager(db_path)
     await qm.initialize()
@@ -26,6 +32,37 @@ async def test_initialize_creates_table(queue):
 
 
 @pytest.mark.asyncio
+async def test_backend_sqlite_detected(tmp_path):
+    """Un path de archivo es detectado como backend SQLite."""
+    db_path = str(tmp_path / "test.db")
+    qm = QueueManager(db_path)
+    assert qm._backend == "sqlite"
+    assert qm.db_path == db_path
+
+
+@pytest.mark.asyncio
+async def test_backend_sqlite_prefix_detected(tmp_path):
+    """El prefijo sqlite:/// es detectado y el path es extraído correctamente."""
+    db_path = str(tmp_path / "test.db")
+    qm = QueueManager(f"sqlite:///{db_path}")
+    assert qm._backend == "sqlite"
+    assert qm.db_path == db_path
+
+
+def test_backend_postgres_detected():
+    """Una URL postgresql:// es detectada como backend Postgres."""
+    qm = QueueManager("postgresql://user:pass@localhost:5432/mydb")
+    assert qm._backend == "postgres"
+    assert qm.db_path is None
+
+
+def test_backend_postgres_short_prefix():
+    """La variante postgres:// también es detectada."""
+    qm = QueueManager("postgres://user:pass@host/db")
+    assert qm._backend == "postgres"
+
+
+@pytest.mark.asyncio
 async def test_enqueue_single(queue):
     biz = Business(name="Test Corp", phone="123", search_query="test")
     row_id = await queue.enqueue(biz)
@@ -35,9 +72,7 @@ async def test_enqueue_single(queue):
 
 @pytest.mark.asyncio
 async def test_enqueue_batch(queue):
-    businesses = [
-        Business(name=f"Corp {i}", search_query="test") for i in range(5)
-    ]
+    businesses = [Business(name=f"Corp {i}", search_query="test") for i in range(5)]
     count = await queue.enqueue_batch(businesses)
     assert count == 5
 
@@ -50,14 +85,11 @@ async def test_enqueue_batch_empty(queue):
 
 @pytest.mark.asyncio
 async def test_dequeue_returns_pending(queue):
-    businesses = [
-        Business(name=f"Corp {i}", search_query="test") for i in range(3)
-    ]
+    businesses = [Business(name=f"Corp {i}", search_query="test") for i in range(3)]
     await queue.enqueue_batch(businesses)
 
     dequeued = await queue.dequeue(limit=2)
     assert len(dequeued) == 2
-    # Los dequeued deben tener nombre
     assert all(b.name.startswith("Corp") for b in dequeued)
 
 
@@ -69,7 +101,6 @@ async def test_dequeue_marks_processing(queue):
     dequeued = await queue.dequeue(limit=10)
     assert len(dequeued) == 1
 
-    # Intentar dequeue de nuevo no debe retornar nada (ya están PROCESSING)
     dequeued_again = await queue.dequeue(limit=10)
     assert len(dequeued_again) == 0
 
@@ -88,12 +119,9 @@ async def test_update_status(queue):
 
 @pytest.mark.asyncio
 async def test_get_stats(queue):
-    businesses = [
-        Business(name=f"Corp {i}", search_query="test") for i in range(4)
-    ]
+    businesses = [Business(name=f"Corp {i}", search_query="test") for i in range(4)]
     await queue.enqueue_batch(businesses)
 
-    # Marcar algunos
     dequeued = await queue.dequeue(limit=2)
     for b in dequeued:
         await queue.update_status(b.id, BusinessStatus.LEAD_QUALIFIED)
