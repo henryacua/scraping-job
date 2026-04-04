@@ -42,8 +42,14 @@ app.include_router(leads.router)
 
 @app.get("/")
 async def root():
-    """Abrir http://localhost:8000/ en el navegador lleva a Swagger UI."""
+    """Abrir la raíz en el navegador lleva a Swagger UI."""
     return RedirectResponse(url="/docs")
+
+
+@app.head("/")
+async def root_head():
+    """Render y otros balanceadores suelen hacer HEAD /; sin esto devuelven 404."""
+    return Response(status_code=200)
 
 
 @app.get("/favicon.ico", include_in_schema=False)
@@ -58,3 +64,8 @@ async def health():
         "service": "scraping-job-ms",
         "available_strategies": list(AVAILABLE_STRATEGIES.keys()),
     }
+
+
+@app.head("/health")
+async def health_head():
+    return Response(status_code=200)
