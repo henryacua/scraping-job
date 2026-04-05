@@ -29,7 +29,7 @@ def create_producer(
     on_progress: Optional[Callable[[str], None]] = None,
     max_results: int = 60,
     headless: bool = True,
-    max_scrolls: int = 20,
+    max_scroll_attempts: int = 20,
     scroll_pause: float = 2.0,
     click_delay_ms: int = 2000,
 ) -> MapsProducer:
@@ -41,7 +41,8 @@ def create_producer(
         return GoogleMapsScraper(
             session,
             headless=headless,
-            max_scrolls=max_scrolls,
+            max_results=max_results,
+            max_scroll_attempts=max_scroll_attempts,
             scroll_pause=scroll_pause,
             click_delay_ms=click_delay_ms,
             on_progress=on_progress,

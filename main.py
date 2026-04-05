@@ -77,10 +77,15 @@ Ejemplos:
         help="Ejecutar el browser en modo visible (no headless)",
     )
     parser.add_argument(
+        "--max-scroll-attempts",
         "--max-scrolls",
         type=int,
         default=settings.MAX_SCROLL_ATTEMPTS,
-        help=f"Máximo de scrolls en el feed de Maps (default: {settings.MAX_SCROLL_ATTEMPTS})",
+        dest="max_scroll_attempts",
+        help=(
+            "Solo Playwright: intentos de scroll en el feed lateral de Maps "
+            f"(default: {settings.MAX_SCROLL_ATTEMPTS}). Con --source places_api no aplica."
+        ),
     )
     parser.add_argument(
         "--source",
@@ -93,7 +98,9 @@ Ejemplos:
         "--max-results",
         type=int,
         default=60,
-        help="Máximo de resultados para Places API (default: 60)",
+        help=(
+            "Máximo de resultados: Playwright tope 60; Places API tope 140 (default: 60)"
+        ),
     )
     return parser.parse_args()
 
@@ -119,7 +126,7 @@ async def async_main(args: argparse.Namespace) -> None:
                 source=args.source,
                 session=session,
                 headless=not args.no_headless,
-                max_scrolls=args.max_scrolls,
+                max_scroll_attempts=args.max_scroll_attempts,
                 max_results=args.max_results,
             )
             count = await producer.run(args.query)

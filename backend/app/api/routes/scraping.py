@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import AliasChoices, BaseModel, Field, model_validator
 
 from backend.app.api.deps import verify_api_key
 
@@ -38,9 +38,32 @@ PLAYWRIGHT_AVAILABLE = _PLAYWRIGHT_INSTALLED
 class ScrapeRequest(BaseModel):
     query: str
     source: Literal["playwright", "places_api"] = "playwright"
-    max_scrolls: int = 20
-    max_results: int = 60
+    max_scroll_attempts: int = Field(
+        default=20,
+        ge=1,
+        description=(
+            "Solo aplica con source=playwright: cuántas veces hacer scroll en el feed lateral "
+            "de resultados. Con places_api se ignora (la búsqueda pagina con ~20 ítems por "
+            "página vía nextPageToken)."
+        ),
+        validation_alias=AliasChoices("max_scroll_attempts", "max_scrolls"),
+    )
+    max_results: int = Field(
+        default=60,
+        ge=1,
+        le=140,
+        description=(
+            "Cuántos negocios como máximo traer. Playwright: tope 60. Places API: tope 140 "
+            "(paginación interna ~20 por llamada)."
+        ),
+    )
     headless: bool = True
+
+    @model_validator(mode="after")
+    def clamp_max_results_by_source(self):
+        if self.source == "playwright" and self.max_results > 60:
+            return self.model_copy(update={"max_results": 60})
+        return self
 
 
 class JobResponse(BaseModel):
@@ -74,7 +97,7 @@ async def _run_scrape(job_id: str, req: ScrapeRequest) -> None:
                 source=req.source,
                 session=session,
                 headless=req.headless,
-                max_scrolls=req.max_scrolls,
+                max_scroll_attempts=req.max_scroll_attempts,
                 max_results=req.max_results,
             )
             count = await producer.run(req.query)

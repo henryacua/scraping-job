@@ -22,6 +22,9 @@ from backend.app.services.utils import normalize_url, sanitize_text, setup_logge
 
 logger = setup_logger(__name__)
 
+# Playwright abre cada resultado en el panel de detalle; se limita el tope para tiempo/coste razonables.
+PLAYWRIGHT_MAX_RESULTS = 60
+
 SEARCH_INPUT = "#searchboxinput"
 SEARCH_BUTTON = "#searchbox-searchbutton"
 RESULTS_CONTAINER = 'div[role="feed"]'
@@ -44,14 +47,16 @@ class GoogleMapsScraper:
         session: AsyncSession,
         *,
         headless: bool = settings.HEADLESS,
-        max_scrolls: int = settings.MAX_SCROLL_ATTEMPTS,
+        max_results: int = PLAYWRIGHT_MAX_RESULTS,
+        max_scroll_attempts: int = settings.MAX_SCROLL_ATTEMPTS,
         scroll_pause: float = settings.SCROLL_PAUSE_SECONDS,
         click_delay_ms: int = settings.CLICK_DELAY_MS,
         on_progress: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.session = session
         self.headless = headless
-        self.max_scrolls = max_scrolls
+        self.max_results = max(1, min(max_results, PLAYWRIGHT_MAX_RESULTS))
+        self.max_scroll_attempts = max_scroll_attempts
         self.scroll_pause = scroll_pause
         self.click_delay_ms = click_delay_ms
         self._on_progress = on_progress
@@ -164,9 +169,15 @@ class GoogleMapsScraper:
         previous_count = 0
         stale_rounds = 0
 
-        for i in range(self.max_scrolls):
+        for i in range(self.max_scroll_attempts):
             items = page.locator(RESULT_ITEMS)
             current_count = await items.count()
+
+            if current_count >= self.max_results:
+                self._emit(
+                    f"Lista con {current_count} items (objetivo {self.max_results}); fin del scroll."
+                )
+                break
 
             if current_count == previous_count:
                 stale_rounds += 1
@@ -177,7 +188,9 @@ class GoogleMapsScraper:
                 stale_rounds = 0
 
             previous_count = current_count
-            self._emit(f"Scroll {i + 1}/{self.max_scrolls} — {current_count} resultados")
+            self._emit(
+                f"Scroll (intento {i + 1}/{self.max_scroll_attempts}) — {current_count} en lista"
+            )
 
             await feed.evaluate("el => el.scrollTop = el.scrollHeight")
             await page.wait_for_timeout(int(self.scroll_pause * 1000))
@@ -192,11 +205,17 @@ class GoogleMapsScraper:
     ) -> list[Business]:
         items = page.locator(RESULT_ITEMS)
         total = await items.count()
-        self._emit(f"Procesando {total} resultados...")
+        limit = min(total, self.max_results)
+        if limit < total:
+            self._emit(
+                f"Procesando hasta {limit} de {total} resultados (tope Playwright: {PLAYWRIGHT_MAX_RESULTS})..."
+            )
+        else:
+            self._emit(f"Procesando {limit} resultados...")
 
         businesses: list[Business] = []
 
-        for idx in range(total):
+        for idx in range(limit):
             try:
                 item = items.nth(idx)
                 await item.scroll_into_view_if_needed()
@@ -208,14 +227,14 @@ class GoogleMapsScraper:
                 biz = await self._extract_detail(page, search_query)
                 if biz:
                     businesses.append(biz)
-                    self._emit(f"  [{idx + 1}/{total}] {biz.name}")
+                    self._emit(f"  [{idx + 1}/{limit}] {biz.name}")
                 else:
-                    self._emit(f"  [{idx + 1}/{total}] No se pudo extraer datos")
+                    self._emit(f"  [{idx + 1}/{limit}] No se pudo extraer datos")
 
                 await page.keyboard.press("Escape")
             except Exception as e:
                 logger.warning("Error extrayendo item %d: %s", idx, e)
-                self._emit(f"  [{idx + 1}/{total}] Error: {e}")
+                self._emit(f"  [{idx + 1}/{limit}] Error: {e}")
                 try:
                     await page.keyboard.press("Escape")
                 except Exception:

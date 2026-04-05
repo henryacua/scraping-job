@@ -336,12 +336,43 @@ with st.sidebar:
 
     if maps_source == "playwright":
         headless = st.checkbox("🖥️ Modo Headless", value=True)
-        max_scrolls = st.slider("📜 Máx. Scrolls", min_value=5, max_value=50, value=20)
-        max_results = 60
+        max_scroll_attempts = st.slider(
+            "📜 Intentos de scroll (feed lateral)",
+            min_value=5,
+            max_value=50,
+            value=20,
+            help=(
+                "Solo en el mapa web: cuántas veces se hace scroll en la lista de resultados. "
+                "Es independiente del “máx. resultados” (cuántos negocios se abren en detalle)."
+            ),
+        )
+        max_results = st.slider(
+            "📋 Máx. resultados (scrape)",
+            min_value=1,
+            max_value=60,
+            value=20,
+            help=(
+                "Tope 60: cada resultado abre el panel de detalle en Maps (tiempo y carga)."
+            ),
+        )
     else:
         headless = True
-        max_scrolls = 20
-        max_results = st.slider("📋 Máx. Resultados", min_value=5, max_value=60, value=20)
+        # Places no usa scroll del feed; la búsqueda pagina sola (~20 por página, nextPageToken).
+        max_scroll_attempts = 20
+        max_results = st.slider(
+            "📋 Máx. resultados (API)",
+            min_value=1,
+            max_value=140,
+            value=20,
+            help=(
+                "Hasta 140 lugares: la API devuelve ~20 por página; el backend sigue el "
+                "nextPageToken (~2 s entre páginas). Luego, 1 Place Details por sitio."
+            ),
+        )
+        st.caption(
+            "Aquí no hay scroll del mapa: es **paginación** de la API + **Place Details** "
+            "(1 llamada por negocio para teléfono, web, etc.)."
+        )
 
     st.markdown("---")
     st.markdown(
@@ -355,15 +386,17 @@ with st.sidebar:
 
 def action_scrape_remote():
     try:
+        scrape_body: dict = {
+            "query": search_query,
+            "source": maps_source,
+            "max_results": max_results,
+            "headless": headless,
+        }
+        if maps_source == "playwright":
+            scrape_body["max_scroll_attempts"] = max_scroll_attempts
         resp = _requests.post(
             f"{settings.RENDER_API_URL}/scrape",
-            json={
-                "query": search_query,
-                "source": maps_source,
-                "max_scrolls": max_scrolls,
-                "max_results": max_results,
-                "headless": headless,
-            },
+            json=scrape_body,
             headers=_api_headers(),
             timeout=15,
         )
@@ -457,7 +490,7 @@ def action_scrape_local():
                     session=session,
                     on_progress=on_progress,
                     headless=headless,
-                    max_scrolls=max_scrolls,
+                    max_scroll_attempts=max_scroll_attempts,
                     max_results=max_results,
                 )
                 return await producer.run(search_query)

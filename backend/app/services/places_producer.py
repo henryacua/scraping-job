@@ -1,16 +1,18 @@
 """
 Producer — PlacesApiProducer
 
-Places API (New) vía SDK oficial `google-maps-places`: Text Search + Place Details.
-Persistencia vía CRUD. No usa el cliente legacy `googlemaps`.
+Places API (New): Text Search vía **REST** (paginación `nextPageToken`) y
+Place Details vía SDK `google-maps-places` (`get_place`).
 
-Requiere GOOGLE_MAPS_API_KEY y el producto Places API (New) habilitado en GCP.
+Requiere GOOGLE_MAPS_API_KEY y Places API (New) habilitada en GCP.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Callable, Optional
 
+import aiohttp
 import google.api_core.exceptions
 from google.maps import places_v1
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -22,7 +24,8 @@ from backend.app.services.utils import normalize_url
 
 logger = logging.getLogger(__name__)
 
-# Field masks sin espacios (obligatorios en la API nueva).
+_SEARCH_TEXT_URL = "https://places.googleapis.com/v1/places:searchText"
+# Field mask REST = mismo formato que gRPC (sin espacios).
 _SEARCH_MASK = (
     "places.id,places.name,places.displayName,places.formattedAddress,"
     "places.types,places.rating,places.userRatingCount"
@@ -31,11 +34,13 @@ _DETAIL_MASK = (
     "displayName,formattedAddress,nationalPhoneNumber,internationalPhoneNumber,"
     "websiteUri,rating,userRatingCount,types,primaryType"
 )
-_METADATA_SEARCH = [("x-goog-fieldmask", _SEARCH_MASK)]
 _METADATA_DETAIL = [("x-goog-fieldmask", _DETAIL_MASK)]
 
-# El proto Python actual limita Text Search a max_result_count <= 20 (sin page_token en respuesta).
-_MAX_TEXT_RESULTS = 20
+# Hasta N lugares en total (varias páginas de 20). Límite para coste/latencia.
+_MAX_TOTAL_RESULTS_CAP = 140
+_PAGE_SIZE = 20
+# Google: esperar antes de usar nextPageToken (evita INVALID_ARGUMENT).
+_PAGE_TOKEN_DELAY_SEC = 2.0
 
 
 def _localized_text(obj: Any) -> Optional[str]:
@@ -45,6 +50,15 @@ def _localized_text(obj: Any) -> Optional[str]:
     if text:
         return str(text).strip() or None
     return None
+
+
+def _json_display_hint(place: dict[str, Any]) -> str:
+    dn = place.get("displayName")
+    if isinstance(dn, dict):
+        t = dn.get("text")
+        if t:
+            return str(t)
+    return place.get("name") or "?"
 
 
 def _place_to_business(place: Any, search_query: str) -> Optional[Business]:
@@ -88,6 +102,67 @@ def _place_to_business(place: Any, search_query: str) -> Optional[Business]:
     )
 
 
+async def _search_text_rest_pages(
+    *,
+    api_key: str,
+    text_query: str,
+    max_results: int,
+    http: aiohttp.ClientSession,
+) -> list[dict[str, Any]]:
+    """Varias páginas de Text Search (REST); como mucho 20 resultados por página."""
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": api_key,
+        "X-Goog-FieldMask": _SEARCH_MASK,
+    }
+    cap = max(1, min(max_results, _MAX_TOTAL_RESULTS_CAP))
+    collected: list[dict[str, Any]] = []
+    page_token: str | None = None
+    page_num = 0
+
+    while len(collected) < cap:
+        page_size = min(_PAGE_SIZE, cap - len(collected))
+        body: dict[str, Any] = {
+            "textQuery": text_query,
+            "languageCode": "es",
+            "pageSize": page_size,
+        }
+        if page_token:
+            body["pageToken"] = page_token
+
+        async with http.post(_SEARCH_TEXT_URL, headers=headers, json=body) as resp:
+            if resp.status != 200:
+                raw = await resp.text()
+                logger.error("searchText HTTP %s: %s", resp.status, raw[:800])
+                raise google.api_core.exceptions.GoogleAPICallError(
+                    f"Places searchText HTTP {resp.status}: {raw[:200]}"
+                )
+            data = await resp.json()
+
+        places = data.get("places") or []
+        page_num += 1
+        for p in places:
+            if len(collected) >= cap:
+                break
+            if isinstance(p, dict):
+                collected.append(p)
+
+        page_token = data.get("nextPageToken") or data.get("next_page_token")
+        if not page_token or not places:
+            break
+        if len(collected) >= cap:
+            break
+        await asyncio.sleep(_PAGE_TOKEN_DELAY_SEC)
+
+    logger.info(
+        "Places searchText: %d lugares en %d pagina(s) (tope pedido %d)",
+        len(collected),
+        page_num,
+        cap,
+    )
+    return collected
+
+
 class PlacesApiProducer:
     """Producer: Places API (New) → persiste vía CRUD."""
 
@@ -118,41 +193,46 @@ class PlacesApiProducer:
     async def run(self, search_query: str) -> int:
         self._emit(f"Iniciando busqueda via Places API (New) para: '{search_query}'")
 
-        per_query = min(_MAX_TEXT_RESULTS, max(1, self.max_results))
-        if self.max_results > _MAX_TEXT_RESULTS:
+        want = max(1, min(self.max_results, _MAX_TOTAL_RESULTS_CAP))
+        if self.max_results > _MAX_TOTAL_RESULTS_CAP:
             self._emit(
-                f"Nota: la API de texto devuelve como maximo {_MAX_TEXT_RESULTS} "
-                f"resultados por consulta (pedidos: {self.max_results})."
+                f"Nota: se limita a {_MAX_TOTAL_RESULTS_CAP} resultados por busqueda "
+                f"(pedidos: {self.max_results})."
             )
+
+        # Varias páginas (p. ej. 140÷20) + pausa 2s entre tokens → margen amplio.
+        _pages = max(1, (want + _PAGE_SIZE - 1) // _PAGE_SIZE)
+        _search_budget = 45.0 * _pages + _PAGE_TOKEN_DELAY_SEC * max(0, _pages - 1)
+        timeout = aiohttp.ClientTimeout(
+            total=min(900.0, max(120.0, _search_budget)),
+            connect=float(settings.HTTP_TIMEOUT),
+        )
 
         businesses: list[Business] = []
         try:
+            async with aiohttp.ClientSession(timeout=timeout) as http:
+                raw_places = await _search_text_rest_pages(
+                    api_key=self._api_key,
+                    text_query=search_query,
+                    max_results=want,
+                    http=http,
+                )
+
+            if not raw_places:
+                self._emit("No se encontraron resultados")
+                return 0
+
+            self._emit(
+                f"{len(raw_places)} resultado(s) en lista; consultando detalles (1 llamada por sitio)..."
+            )
+            total = len(raw_places)
+
             async with places_v1.PlacesAsyncClient(
                 client_options={"api_key": self._api_key}
             ) as client:
-                search_req = places_v1.SearchTextRequest(
-                    text_query=search_query,
-                    language_code="es",
-                    max_result_count=per_query,
-                )
-                search_resp = await client.search_text(
-                    request=search_req,
-                    metadata=_METADATA_SEARCH,
-                )
-                raw_places = list(search_resp.places)
-
-                if not raw_places:
-                    self._emit("No se encontraron resultados")
-                    return 0
-
-                self._emit(f"{len(raw_places)} resultados; consultando detalles...")
-                total = len(raw_places)
-
                 for idx, summary in enumerate(raw_places):
-                    resource = getattr(summary, "name", None) or ""
-                    hint = _localized_text(
-                        getattr(summary, "display_name", None)
-                    ) or resource or "?"
+                    resource = summary.get("name") or ""
+                    hint = _json_display_hint(summary)
 
                     if not resource.startswith("places/"):
                         self._emit(

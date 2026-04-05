@@ -172,7 +172,7 @@ python main.py --process-only
 python main.py --no-headless --query "Veterinarios en Barranquilla"
 
 # Controlar máximo de scrolls
-python main.py --max-scrolls 10 --query "Restaurantes en Cali"
+python main.py --max-scroll-attempts 10 --query "Restaurantes en Cali"
 ```
 
 ### Flags CLI
@@ -184,7 +184,7 @@ python main.py --max-scrolls 10 --query "Restaurantes en Cali"
 | `--process-only` | Solo procesar leads pendientes (Consumer) |
 | `--actions, -a` | Acciones: `FilterInvalidPhone`, `FilterNoWhatsApp` |
 | `--no-headless` | Mostrar el browser durante el scraping |
-| `--max-scrolls` | Límite de scrolls en el feed de Maps |
+| `--max-scroll-attempts` | Solo Playwright: intentos de scroll en el feed lateral (`--max-scrolls` sigue siendo alias) |
 
 ### Migraciones (Alembic)
 
