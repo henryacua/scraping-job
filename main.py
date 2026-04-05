@@ -19,7 +19,7 @@ import sys
 from backend.app.core.config import settings
 from backend.app.core.db import create_db_and_tables, engine
 from backend.app import crud
-from backend.app.services.scraper import GoogleMapsScraper
+from backend.app.services.producer import create_producer
 from backend.app.services.processor import LeadProcessor
 from backend.app.services.strategies import (
     AVAILABLE_STRATEGIES,
@@ -49,8 +49,8 @@ Ejemplos:
     parser.add_argument(
         "--query", "-q",
         type=str,
-        default=settings.SEARCH_QUERY,
-        help=f"Término de búsqueda (default: '{settings.SEARCH_QUERY}')",
+        default="Dentistas en Medellín",
+        help="Término de búsqueda (default: 'Dentistas en Medellín')",
     )
     parser.add_argument(
         "--scrape-only",
@@ -82,6 +82,19 @@ Ejemplos:
         default=settings.MAX_SCROLL_ATTEMPTS,
         help=f"Máximo de scrolls en el feed de Maps (default: {settings.MAX_SCROLL_ATTEMPTS})",
     )
+    parser.add_argument(
+        "--source",
+        type=str,
+        choices=["playwright", "places_api"],
+        default=settings.MAPS_SOURCE,
+        help=f"Fuente de datos: playwright (scraper) o places_api (Google API) (default: {settings.MAPS_SOURCE})",
+    )
+    parser.add_argument(
+        "--max-results",
+        type=int,
+        default=60,
+        help="Máximo de resultados para Places API (default: 60)",
+    )
     return parser.parse_args()
 
 
@@ -99,16 +112,18 @@ async def async_main(args: argparse.Namespace) -> None:
     async with AsyncSession(engine) as session:
         if not args.process_only:
             logger.info("=" * 60)
-            logger.info("FASE 1: SCRAPING (Producer)")
+            logger.info("FASE 1: BUSQUEDA (Producer — %s)", args.source)
             logger.info("=" * 60)
 
-            scraper = GoogleMapsScraper(
-                session,
+            producer = create_producer(
+                source=args.source,
+                session=session,
                 headless=not args.no_headless,
                 max_scrolls=args.max_scrolls,
+                max_results=args.max_results,
             )
-            count = await scraper.run(args.query)
-            logger.info("Scraping finalizado: %d negocios extraidos", count)
+            count = await producer.run(args.query)
+            logger.info("Busqueda finalizada: %d negocios extraidos", count)
 
         if not args.scrape_only:
             logger.info("=" * 60)

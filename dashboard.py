@@ -6,11 +6,11 @@ Ejecución local:
 
 Deploy en Streamlit Cloud:
     - Conectar el repo de GitHub
-    - Configurar DATABASE_URL, RENDER_API_URL y API_KEY en Secrets
+    - Configurar DATABASE_URL, RENDER_API_URL, API_KEY y DASHBOARD_MODE en Secrets
 
-Modos de operación:
-    - RENDER_API_URL configurada → llama al Worker en Render vía HTTP
-    - RENDER_API_URL vacía       → ejecuta scraping/procesamiento localmente
+Modos de operación (controlado por DASHBOARD_MODE):
+    - DASHBOARD_MODE=local  → ejecuta scraping/procesamiento en el mismo proceso
+    - DASHBOARD_MODE=remote → delega al Worker en Render vía HTTP (RENDER_API_URL)
 """
 from __future__ import annotations
 
@@ -42,8 +42,34 @@ from backend.app.services.strategies import AVAILABLE_STRATEGIES, get_strategy, 
 
 
 def run_async(coro):
-    """Ejecuta una coroutine dentro del hilo de Streamlit (sin uvloop)."""
-    return asyncio.run(coro)
+    """Ejecuta una coroutine de forma segura en el hilo de Streamlit.
+
+    Cada llamada crea un nuevo loop para evitar que Streamlit mezcle hilos.
+    - engine.dispose() descarta conexiones del pool viejo (distinto loop).
+    - El exception handler suprime el ruido de cleanup SSL de asyncpg que
+      ocurre cuando asyncio.run() cierra el loop y los transportes SSL intentan
+      abortar con 'Event loop is closed' (harmless, no es un error real).
+    """
+    async def _dispose_and_run():
+        await engine.dispose()
+        return await coro
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    def _handle_exc(lp: asyncio.AbstractEventLoop, ctx: dict) -> None:
+        if "Event loop is closed" in ctx.get("message", ""):
+            return  # asyncpg SSL cleanup after loop close — ruido esperado
+        lp.default_exception_handler(ctx)
+
+    loop.set_exception_handler(_handle_exc)
+    try:
+        return loop.run_until_complete(_dispose_and_run())
+    finally:
+        try:
+            loop.close()
+        except Exception:
+            pass
 
 
 async def _get_session():
@@ -209,7 +235,15 @@ st.markdown("""
 
 # ── Header ────────────────────────────────────────────────
 
-remote_mode = bool(settings.RENDER_API_URL)
+remote_mode = settings.DASHBOARD_MODE.lower() == "remote"
+
+if remote_mode and not settings.RENDER_API_URL:
+    st.error(
+        "**DASHBOARD_MODE=remote** pero **RENDER_API_URL** está vacía. "
+        "Configura la URL del worker en `.env` o cambia a `DASHBOARD_MODE=local`."
+    )
+    st.stop()
+
 mode_label = "Render (remoto)" if remote_mode else "Local"
 mode_class = "mode-remote" if remote_mode else "mode-local"
 
@@ -260,19 +294,44 @@ with st.sidebar:
         format_func=lambda x: f"{x} — {AVAILABLE_STRATEGIES[x].__doc__.strip().split(chr(10))[0] if AVAILABLE_STRATEGIES[x].__doc__ else x}",
     )
 
+    maps_source = st.radio(
+        "🗺️ Fuente de datos",
+        options=["playwright", "places_api"],
+        format_func=lambda x: {
+            "playwright": "Playwright (scraper local)",
+            "places_api": "Places API (Google)",
+        }[x],
+        index=0 if settings.MAPS_SOURCE == "playwright" else 1,
+        horizontal=True,
+    )
+
+    if maps_source == "places_api" and not settings.GOOGLE_MAPS_API_KEY:
+        st.warning(
+            "Configura **GOOGLE_MAPS_API_KEY** en `.env` para usar Places API.",
+            icon="🔑",
+        )
+
     st.markdown("---")
     st.markdown("## 🚀 Ejecución")
 
     col_a, col_b = st.columns(2)
     with col_a:
-        btn_scrape = st.button("🔍 Buscar (Scrape)", use_container_width=True, type="primary")
+        btn_label = "🔍 Buscar (Scrape)" if maps_source == "playwright" else "🔍 Buscar (API)"
+        btn_scrape = st.button(btn_label, use_container_width=True, type="primary")
     with col_b:
         btn_process = st.button("⚡ Procesar Leads", use_container_width=True)
 
     st.markdown("---")
     st.markdown("## 📊 Opciones")
-    headless = st.checkbox("🖥️ Modo Headless", value=True)
-    max_scrolls = st.slider("📜 Máx. Scrolls", min_value=5, max_value=50, value=20)
+
+    if maps_source == "playwright":
+        headless = st.checkbox("🖥️ Modo Headless", value=True)
+        max_scrolls = st.slider("📜 Máx. Scrolls", min_value=5, max_value=50, value=20)
+        max_results = 60
+    else:
+        headless = True
+        max_scrolls = 20
+        max_results = st.slider("📋 Máx. Resultados", min_value=5, max_value=60, value=20)
 
     st.markdown("---")
     st.markdown(
@@ -288,10 +347,27 @@ def action_scrape_remote():
     try:
         resp = _requests.post(
             f"{settings.RENDER_API_URL}/scrape",
-            json={"query": search_query, "max_scrolls": max_scrolls, "headless": headless},
+            json={
+                "query": search_query,
+                "source": maps_source,
+                "max_scrolls": max_scrolls,
+                "max_results": max_results,
+                "headless": headless,
+            },
             headers=_api_headers(),
             timeout=15,
         )
+        if resp.status_code == 503:
+            detail = resp.json().get("detail", "")
+            st.warning(
+                "**El scraping con Playwright no puede ejecutarse en Render** — "
+                "Google bloquea las IPs de datacenters.\n\n"
+                "**¿Qué hacer?** Cambia `DASHBOARD_MODE=local` en tu `.env` para "
+                "ejecutar el scraping desde tu máquina con IP residencial, o "
+                "selecciona **Places API (Google)** como fuente de datos.",
+                icon="⚠️",
+            )
+            return
         resp.raise_for_status()
     except Exception as exc:
         st.error(f"No se pudo contactar el Worker en Render: {exc}")
@@ -348,7 +424,7 @@ def action_process_remote():
 # ── Acciones: modo local ──────────────────────────────────
 
 def action_scrape_local():
-    from backend.app.services.scraper import GoogleMapsScraper
+    from backend.app.services.producer import create_producer
 
     existing = run_async(_get_all_businesses(search_query))
     if existing:
@@ -361,25 +437,28 @@ def action_scrape_local():
         logs.append(msg)
         log_container.code("\n".join(logs[-10:]), language="text")
 
-    progress_bar = st.progress(0, text="Iniciando scraping...")
+    source_label = "Places API" if maps_source == "places_api" else "scraping"
+    progress_bar = st.progress(0, text=f"Iniciando {source_label}...")
     try:
         async def _do_scrape():
             async with AsyncSession(engine) as session:
-                scraper = GoogleMapsScraper(
-                    session,
+                producer = create_producer(
+                    source=maps_source,
+                    session=session,
+                    on_progress=on_progress,
                     headless=headless,
                     max_scrolls=max_scrolls,
-                    on_progress=on_progress,
+                    max_results=max_results,
                 )
-                return await scraper.run(search_query)
+                return await producer.run(search_query)
 
         count = run_async(_do_scrape())
         progress_bar.progress(100, text=f"✅ {count} negocios encontrados")
-        st.success(f"Scraping completado: **{count}** negocios para *\"{search_query}\"*")
+        st.success(f"Busqueda completada: **{count}** negocios para *\"{search_query}\"*")
         st.rerun()
     except Exception as exc:
         progress_bar.progress(0, text="❌ Error")
-        st.error(f"Error durante el scraping: {exc}")
+        st.error(f"Error durante la busqueda: {exc}")
 
 
 def action_process_local():

@@ -46,12 +46,14 @@ class GoogleMapsScraper:
         headless: bool = settings.HEADLESS,
         max_scrolls: int = settings.MAX_SCROLL_ATTEMPTS,
         scroll_pause: float = settings.SCROLL_PAUSE_SECONDS,
+        click_delay_ms: int = settings.CLICK_DELAY_MS,
         on_progress: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.session = session
         self.headless = headless
         self.max_scrolls = max_scrolls
         self.scroll_pause = scroll_pause
+        self.click_delay_ms = click_delay_ms
         self._on_progress = on_progress
 
     def _emit(self, message: str) -> None:
@@ -198,8 +200,10 @@ class GoogleMapsScraper:
             try:
                 item = items.nth(idx)
                 await item.scroll_into_view_if_needed()
-                await item.click()
-                await page.wait_for_timeout(1500)
+                # Maps es SPA: tras el clic Playwright puede colgarse esperando
+                # "scheduled navigations"; no_wait_after + espera fija al panel.
+                await item.click(no_wait_after=True, timeout=15000)
+                await page.wait_for_timeout(self.click_delay_ms)
 
                 biz = await self._extract_detail(page, search_query)
                 if biz:

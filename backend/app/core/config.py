@@ -26,7 +26,8 @@ class Settings(BaseSettings):
     # Supabase:    postgresql+asyncpg://user:pass@host:5432/postgres
     DATABASE_URL: str = f"sqlite+aiosqlite:///{_PROJECT_ROOT / 'queue.db'}"
 
-    # Solo desarrollo / redes con inspección SSL: no verificar cadena TLS (riesgo MITM).
+    # Flag avanzada solo para troubleshooting local: mantiene TLS, pero desactiva
+    # la verificación del certificado. No debería usarse como configuración normal.
     DATABASE_SSL_INSECURE: bool = False
 
     @field_validator("DATABASE_URL", mode="before")
@@ -42,22 +43,26 @@ class Settings(BaseSettings):
             return "postgresql+asyncpg://" + s[len("postgresql://") :]
         return s
 
-    # Búsqueda
-    SEARCH_QUERY: str = "Dentistas en Medellín"
+    # Maps source: "playwright" (scraper local) o "places_api" (Google API)
+    MAPS_SOURCE: str = "playwright"
+
+    # Google Maps Platform — solo necesario si MAPS_SOURCE=places_api
+    GOOGLE_MAPS_API_KEY: str = ""
 
     # Playwright / Scraper
     HEADLESS: bool = True
     MAX_SCROLL_ATTEMPTS: int = 20
     SCROLL_PAUSE_SECONDS: float = 2.0
+    CLICK_DELAY_MS: int = 2000
 
     # HTTP
     HTTP_TIMEOUT: int = 10
     BATCH_SIZE: int = 10
 
-    # Salida
-    OUTPUT_DIR: str = str(_PROJECT_ROOT / "output")
+    # Dashboard: "local" ejecuta todo en proceso; "remote" delega a Render vía HTTP.
+    DASHBOARD_MODE: str = "local"
 
-    # API interna (Render ↔ Streamlit Cloud)
+    # API interna (Render ↔ Streamlit Cloud) — solo se usa si DASHBOARD_MODE=remote
     RENDER_API_URL: str = ""
     API_KEY: str = ""
 
