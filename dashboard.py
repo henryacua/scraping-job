@@ -6,7 +6,7 @@ Ejecución local:
 
 Deploy en Streamlit Cloud:
     - Conectar el repo de GitHub
-    - Configurar DATABASE_URL, RENDER_API_URL, API_KEY y DASHBOARD_MODE en Secrets
+    - Pegar variables en el panel Secrets (TOML); en local usa solo .env en la raíz del repo.
 
 Modos de operación (controlado por DASHBOARD_MODE):
     - DASHBOARD_MODE=local  → ejecuta scraping/procesamiento en el mismo proceso
@@ -42,29 +42,39 @@ from backend.app.services.strategies import AVAILABLE_STRATEGIES, get_strategy, 
 
 
 def run_async(coro):
-    """Ejecuta una coroutine de forma segura en el hilo de Streamlit.
+    """Ejecuta una coroutine en un loop dedicado (Streamlit corre en otro hilo).
 
-    Cada llamada crea un nuevo loop para evitar que Streamlit mezcle hilos.
-    - engine.dispose() descarta conexiones del pool viejo (distinto loop).
-    - El exception handler suprime el ruido de cleanup SSL de asyncpg que
-      ocurre cuando asyncio.run() cierra el loop y los transportes SSL intentan
-      abortar con 'Event loop is closed' (harmless, no es un error real).
+    Postgres + asyncpg: el engine usa NullPool bajo Streamlit; aun así hacemos
+    dispose al inicio y en finally **antes** de cerrar el loop para que los
+    transportes SSL no programen callbacks en un loop ya cerrado.
     """
-    async def _dispose_and_run():
-        await engine.dispose()
-        return await coro
+    async def _wrapped():
+        try:
+            await engine.dispose()
+        except Exception:
+            pass
+        try:
+            return await coro
+        finally:
+            try:
+                await engine.dispose()
+            except Exception:
+                pass
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     def _handle_exc(lp: asyncio.AbstractEventLoop, ctx: dict) -> None:
-        if "Event loop is closed" in ctx.get("message", ""):
-            return  # asyncpg SSL cleanup after loop close — ruido esperado
+        exc = ctx.get("exception")
+        if isinstance(exc, RuntimeError) and "Event loop is closed" in str(exc):
+            return
+        if "Event loop is closed" in str(ctx.get("message", "")):
+            return
         lp.default_exception_handler(ctx)
 
     loop.set_exception_handler(_handle_exc)
     try:
-        return loop.run_until_complete(_dispose_and_run())
+        return loop.run_until_complete(_wrapped())
     finally:
         try:
             loop.close()

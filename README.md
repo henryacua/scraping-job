@@ -53,9 +53,11 @@ scraping-job-ms/
 │
 ├── dashboard.py                    # Dashboard Streamlit (Streamlit Cloud)
 ├── main.py                         # CLI orquestador
-├── Dockerfile                      # Imagen Docker para Render
+├── Dockerfile                      # Render: Streamlit dashboard.py
+├── Dockerfile.worker               # Render: FastAPI + Places SDK + Playwright (un solo worker)
 ├── requirements.txt                # Deps Streamlit Cloud (sin Playwright)
-├── requirements-render.txt         # Deps Render worker (con Playwright)
+├── requirements-render.txt         # Deps imagen playwright (Render)
+├── requirements-render-places.txt  # Deps imagen ligera Places API (Render)
 └── .env.example                    # Variables de entorno de referencia
 ```
 
@@ -65,9 +67,16 @@ El proyecto usa **tres servicios gratuitos** coordinados:
 
 | Servicio | Qué corre | URL configurada en |
 |----------|-----------|-------------------|
-| **Render** | `backend/app/main.py` (FastAPI + Playwright) | `RENDER_API_URL` |
-| **Streamlit Cloud** | `dashboard.py` | — |
+| **Render (Docker)** | `Dockerfile` → Streamlit; `Dockerfile.worker` → API (`source` = `places_api` o `playwright`) | `RENDER_API_URL` (si `DASHBOARD_MODE=remote`) |
+| **Streamlit Cloud** | `dashboard.py` (sin Docker en su flujo nativo) | — |
 | **Supabase** | PostgreSQL persistente | `DATABASE_URL` |
+
+### Render (Docker)
+
+| Archivo | Contenido |
+|---------|-----------|
+| `Dockerfile` | **Streamlit** — `streamlit run dashboard.py` (`requirements.txt`). |
+| `Dockerfile.worker` | **FastAPI**: SDK Places + Playwright. El modo lo elige `source` en `POST /scrape`. |
 
 ## Setup local
 

@@ -22,8 +22,9 @@ class BusinessStatus(str, enum.Enum):
     ERROR = "ERROR"
 
 
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+def utc_now() -> datetime:
+    """UTC sin tzinfo: Postgres/asyncpg con TIMESTAMP sin time zone y SQLite lo exigen así."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 # ── Table models ──────────────────────────────────────────
@@ -31,6 +32,8 @@ def _utc_now() -> datetime:
 
 class Business(SQLModel, table=True):
     __tablename__ = "businesses"
+    # Streamlit reejecuta el script; evita "Table already defined" en SQLModel.metadata.
+    __table_args__ = {"extend_existing": True}
 
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str = Field(max_length=255)
@@ -44,17 +47,18 @@ class Business(SQLModel, table=True):
     reviews_count: Optional[str] = None
     category: Optional[str] = None
     filter_reason: Optional[str] = None
-    created_at: datetime = Field(default_factory=_utc_now)
-    updated_at: datetime = Field(default_factory=_utc_now)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
 
 
 class MessageLog(SQLModel, table=True):
     __tablename__ = "message_logs"
+    __table_args__ = {"extend_existing": True}
 
     id: Optional[int] = Field(default=None, primary_key=True)
     business_id: int = Field(foreign_key="businesses.id", index=True)
     status: str
-    sent_at: datetime = Field(default_factory=_utc_now)
+    sent_at: datetime = Field(default_factory=utc_now)
     message_template: Optional[str] = None
 
 

@@ -7,20 +7,15 @@ por lo que el SQL se genera automáticamente para Postgres y SQLite.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
 from typing import Optional, Sequence
 
 from sqlalchemy import func
 from sqlmodel import delete, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from backend.app.models import Business, BusinessStatus, MessageLog
+from backend.app.models import Business, BusinessStatus, MessageLog, utc_now
 
 logger = logging.getLogger(__name__)
-
-
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 # ── Escritura ─────────────────────────────────────────────
@@ -29,8 +24,8 @@ def _utc_now() -> datetime:
 async def enqueue(session: AsyncSession, business: Business) -> Business:
     """Inserta un negocio con estado PENDING. Retorna el objeto con ID asignado."""
     business.status = BusinessStatus.PENDING.value
-    business.created_at = _utc_now()
-    business.updated_at = _utc_now()
+    business.created_at = utc_now()
+    business.updated_at = utc_now()
     session.add(business)
     await session.commit()
     await session.refresh(business)
@@ -41,7 +36,7 @@ async def enqueue_batch(session: AsyncSession, businesses: list[Business]) -> in
     """Inserta múltiples negocios en una sola transacción."""
     if not businesses:
         return 0
-    now = _utc_now()
+    now = utc_now()
     for b in businesses:
         b.status = BusinessStatus.PENDING.value
         b.created_at = now
@@ -69,7 +64,7 @@ async def dequeue(session: AsyncSession, limit: int = 10) -> list[Business]:
     if not rows:
         return []
 
-    now = _utc_now()
+    now = utc_now()
     for row in rows:
         row.status = BusinessStatus.PROCESSING.value
         row.updated_at = now
@@ -88,7 +83,7 @@ async def update_status(
     biz = await session.get(Business, business_id)
     if biz:
         biz.status = status.value
-        biz.updated_at = _utc_now()
+        biz.updated_at = utc_now()
         session.add(biz)
         await session.commit()
 
@@ -100,7 +95,7 @@ async def update_filter_reason(
     biz = await session.get(Business, business_id)
     if biz:
         biz.filter_reason = reason
-        biz.updated_at = _utc_now()
+        biz.updated_at = utc_now()
         session.add(biz)
         await session.commit()
 
@@ -170,7 +165,7 @@ async def log_message(
     entry = MessageLog(
         business_id=business_id,
         status=status,
-        sent_at=_utc_now(),
+        sent_at=utc_now(),
         message_template=template,
     )
     session.add(entry)

@@ -2,16 +2,14 @@
 Router de scraping — lanza jobs de busqueda de negocios en background.
 
 Soporta dos fuentes de datos (source):
-  - "playwright": scraper con navegador — requiere IP residencial;
-    no se permite en datacenters.
-  - "places_api": Google Maps Places API — funciona en cualquier entorno;
-    requiere GOOGLE_MAPS_API_KEY.
+  - "playwright": scraper con navegador (requiere Playwright en la imagen;
+    en IPs de datacenter Google puede bloquear o capar).
+  - "places_api": Places API (New) — requiere GOOGLE_MAPS_API_KEY.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import uuid
 from datetime import datetime, timezone
 from typing import Literal
@@ -27,8 +25,14 @@ router = APIRouter(tags=["scraping"])
 
 _jobs: dict[str, dict] = {}
 
-_ON_RENDER = os.getenv("RENDER", "").lower() in ("true", "1", "yes")
-PLAYWRIGHT_AVAILABLE = not _ON_RENDER
+try:
+    import playwright  # noqa: F401
+
+    _PLAYWRIGHT_INSTALLED = True
+except ImportError:
+    _PLAYWRIGHT_INSTALLED = False
+
+PLAYWRIGHT_AVAILABLE = _PLAYWRIGHT_INSTALLED
 
 
 class ScrapeRequest(BaseModel):
@@ -49,9 +53,8 @@ def _check_source_available(source: str) -> None:
         raise HTTPException(
             status_code=503,
             detail=(
-                "El scraping con Playwright no esta disponible en este entorno cloud. "
-                "Google bloquea las IPs de datacenters. Usa source='places_api' o ejecuta "
-                "el scraping desde el dashboard en modo LOCAL."
+                "Playwright no esta instalado en esta imagen. Usa source='places_api' "
+                "o despliega el worker con Dockerfile.worker (Chromium incluido)."
             ),
         )
 

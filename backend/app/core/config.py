@@ -26,8 +26,7 @@ class Settings(BaseSettings):
     # Supabase:    postgresql+asyncpg://user:pass@host:5432/postgres
     DATABASE_URL: str = f"sqlite+aiosqlite:///{_PROJECT_ROOT / 'queue.db'}"
 
-    # Flag avanzada solo para troubleshooting local: mantiene TLS, pero desactiva
-    # la verificación del certificado. No debería usarse como configuración normal.
+    # Postgres/Supabase: true = TLS cifrado sin verificar el certificado del servidor.
     DATABASE_SSL_INSECURE: bool = False
 
     @field_validator("DATABASE_URL", mode="before")
