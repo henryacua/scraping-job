@@ -1,51 +1,95 @@
 """
 Producer — PlacesApiProducer
 
-Busca negocios en Google Maps mediante la Places API (Text Search + Place Details)
-y los persiste vía CRUD.  Alternativa al scraper Playwright que funciona desde
-cualquier entorno (datacenter incluido) sin navegador.
+Places API (New) vía SDK oficial `google-maps-places`: Text Search + Place Details.
+Persistencia vía CRUD. No usa el cliente legacy `googlemaps`.
 
-Requiere GOOGLE_MAPS_API_KEY en las variables de entorno.
+Requiere GOOGLE_MAPS_API_KEY y el producto Places API (New) habilitado en GCP.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
-import time
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
-import googlemaps
+import google.api_core.exceptions
+from google.maps import places_v1
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from backend.app import crud
 from backend.app.core.config import settings
 from backend.app.models import Business
+from backend.app.services.utils import normalize_url
 
 logger = logging.getLogger(__name__)
 
-TEXT_SEARCH_FIELDS = [
-    "name",
-    "formatted_address",
-    "place_id",
-    "rating",
-    "user_ratings_total",
-    "types",
-]
+# Field masks sin espacios (obligatorios en la API nueva).
+_SEARCH_MASK = (
+    "places.id,places.name,places.displayName,places.formattedAddress,"
+    "places.types,places.rating,places.userRatingCount"
+)
+_DETAIL_MASK = (
+    "displayName,formattedAddress,nationalPhoneNumber,internationalPhoneNumber,"
+    "websiteUri,rating,userRatingCount,types,primaryType"
+)
+_METADATA_SEARCH = [("x-goog-fieldmask", _SEARCH_MASK)]
+_METADATA_DETAIL = [("x-goog-fieldmask", _DETAIL_MASK)]
 
-DETAIL_FIELDS = [
-    "name",
-    "formatted_address",
-    "formatted_phone_number",
-    "international_phone_number",
-    "website",
-    "rating",
-    "user_ratings_total",
-    "types",
-]
+# El proto Python actual limita Text Search a max_result_count <= 20 (sin page_token en respuesta).
+_MAX_TEXT_RESULTS = 20
+
+
+def _localized_text(obj: Any) -> Optional[str]:
+    if obj is None:
+        return None
+    text = getattr(obj, "text", None)
+    if text:
+        return str(text).strip() or None
+    return None
+
+
+def _place_to_business(place: Any, search_query: str) -> Optional[Business]:
+    name = _localized_text(getattr(place, "display_name", None))
+    if not name:
+        return None
+
+    phone = (
+        (getattr(place, "international_phone_number", None) or "").strip()
+        or (getattr(place, "national_phone_number", None) or "").strip()
+        or None
+    )
+
+    types = list(getattr(place, "types", []) or [])
+    primary = getattr(place, "primary_type", None) or ""
+    category = None
+    if primary:
+        category = primary.replace("_", " ").title()
+    elif types:
+        category = types[0].replace("_", " ").title()
+
+    rating = getattr(place, "rating", None)
+    rating_str = str(rating) if rating is not None else None
+
+    urc = getattr(place, "user_rating_count", None)
+    reviews_str = str(urc) if urc is not None else None
+
+    raw_web = getattr(place, "website_uri", None)
+    website = normalize_url(raw_web) if raw_web else None
+
+    return Business(
+        name=name,
+        phone=phone or None,
+        address=(getattr(place, "formatted_address", None) or "").strip() or None,
+        website=website,
+        email=None,
+        search_query=search_query,
+        rating=rating_str,
+        reviews_count=reviews_str,
+        category=category,
+    )
 
 
 class PlacesApiProducer:
-    """Producer: Google Maps Places API → persiste vía CRUD."""
+    """Producer: Places API (New) → persiste vía CRUD."""
 
     def __init__(
         self,
@@ -64,7 +108,7 @@ class PlacesApiProducer:
                 "GOOGLE_MAPS_API_KEY no configurada. "
                 "Agrégala en .env o en las variables de entorno."
             )
-        self._client = googlemaps.Client(key=api_key)
+        self._api_key = api_key
 
     def _emit(self, message: str) -> None:
         logger.info(message)
@@ -72,15 +116,74 @@ class PlacesApiProducer:
             self._on_progress(message)
 
     async def run(self, search_query: str) -> int:
-        self._emit(f"Iniciando busqueda via Places API para: '{search_query}'")
+        self._emit(f"Iniciando busqueda via Places API (New) para: '{search_query}'")
 
-        raw_places = await self._text_search(search_query)
-        if not raw_places:
-            self._emit("No se encontraron resultados en Places API")
-            return 0
+        per_query = min(_MAX_TEXT_RESULTS, max(1, self.max_results))
+        if self.max_results > _MAX_TEXT_RESULTS:
+            self._emit(
+                f"Nota: la API de texto devuelve como maximo {_MAX_TEXT_RESULTS} "
+                f"resultados por consulta (pedidos: {self.max_results})."
+            )
 
-        self._emit(f"{len(raw_places)} resultados obtenidos, consultando detalles...")
-        businesses = await self._fetch_details(raw_places, search_query)
+        businesses: list[Business] = []
+        try:
+            async with places_v1.PlacesAsyncClient(
+                client_options={"api_key": self._api_key}
+            ) as client:
+                search_req = places_v1.SearchTextRequest(
+                    text_query=search_query,
+                    language_code="es",
+                    max_result_count=per_query,
+                )
+                search_resp = await client.search_text(
+                    request=search_req,
+                    metadata=_METADATA_SEARCH,
+                )
+                raw_places = list(search_resp.places)
+
+                if not raw_places:
+                    self._emit("No se encontraron resultados")
+                    return 0
+
+                self._emit(f"{len(raw_places)} resultados; consultando detalles...")
+                total = len(raw_places)
+
+                for idx, summary in enumerate(raw_places):
+                    resource = getattr(summary, "name", None) or ""
+                    hint = _localized_text(
+                        getattr(summary, "display_name", None)
+                    ) or resource or "?"
+
+                    if not resource.startswith("places/"):
+                        self._emit(
+                            f"  [{idx + 1}/{total}] Sin nombre de recurso, omitiendo"
+                        )
+                        continue
+
+                    try:
+                        detail_req = places_v1.GetPlaceRequest(
+                            name=resource,
+                            language_code="es",
+                        )
+                        detail = await client.get_place(
+                            request=detail_req,
+                            metadata=_METADATA_DETAIL,
+                        )
+                        biz = _place_to_business(detail, search_query)
+                        if biz:
+                            businesses.append(biz)
+                            self._emit(f"  [{idx + 1}/{total}] {biz.name}")
+                        else:
+                            self._emit(
+                                f"  [{idx + 1}/{total}] {hint} — sin datos suficientes"
+                            )
+                    except google.api_core.exceptions.GoogleAPICallError as exc:
+                        logger.warning("get_place %s: %s", resource, exc)
+                        self._emit(f"  [{idx + 1}/{total}] {hint} — error: {exc}")
+        except google.api_core.exceptions.GoogleAPICallError as exc:
+            logger.error("Places API fallo: %s", exc, exc_info=True)
+            self._emit(f"Error API Places: {exc}")
+            raise
 
         if businesses:
             count = await crud.enqueue_batch(self.session, businesses)
@@ -89,106 +192,3 @@ class PlacesApiProducer:
 
         self._emit("No se pudieron extraer negocios de los resultados")
         return 0
-
-    async def _text_search(self, query: str) -> list[dict]:
-        """Ejecuta Text Search con paginación hasta max_results."""
-        all_results: list[dict] = []
-        page_token: Optional[str] = None
-        page = 0
-
-        while len(all_results) < self.max_results:
-            page += 1
-            self._emit(f"Text Search página {page}...")
-
-            response = await asyncio.to_thread(
-                self._client.places,
-                query=query,
-                language="es",
-                page_token=page_token,
-            )
-
-            results = response.get("results", [])
-            if not results:
-                break
-
-            all_results.extend(results)
-            self._emit(f"  Página {page}: {len(results)} resultados (total: {len(all_results)})")
-
-            page_token = response.get("next_page_token")
-            if not page_token:
-                break
-
-            # Google requiere ~2 s antes de poder usar el next_page_token
-            await asyncio.sleep(2.0)
-
-        trimmed = all_results[: self.max_results]
-        self._emit(f"Text Search completado: {len(trimmed)} resultados")
-        return trimmed
-
-    async def _fetch_details(
-        self, places: list[dict], search_query: str
-    ) -> list[Business]:
-        """Consulta Place Details para cada resultado y mapea a Business."""
-        businesses: list[Business] = []
-        total = len(places)
-
-        for idx, place in enumerate(places):
-            place_id = place.get("place_id")
-            name_hint = place.get("name", "?")
-
-            if not place_id:
-                self._emit(f"  [{idx + 1}/{total}] Sin place_id, omitiendo")
-                continue
-
-            try:
-                detail = await asyncio.to_thread(
-                    self._client.place,
-                    place_id=place_id,
-                    fields=DETAIL_FIELDS,
-                    language="es",
-                )
-                result = detail.get("result", {})
-                biz = self._map_to_business(result, search_query)
-                if biz:
-                    businesses.append(biz)
-                    self._emit(f"  [{idx + 1}/{total}] {biz.name}")
-                else:
-                    self._emit(f"  [{idx + 1}/{total}] {name_hint} — sin datos suficientes")
-            except Exception as exc:
-                logger.warning("Error obteniendo detalle de %s: %s", place_id, exc)
-                self._emit(f"  [{idx + 1}/{total}] {name_hint} — error: {exc}")
-
-        return businesses
-
-    @staticmethod
-    def _map_to_business(result: dict, search_query: str) -> Optional[Business]:
-        """Convierte la respuesta de Place Details a un modelo Business."""
-        name = result.get("name")
-        if not name:
-            return None
-
-        phone = (
-            result.get("international_phone_number")
-            or result.get("formatted_phone_number")
-        )
-
-        types = result.get("types", [])
-        category = types[0].replace("_", " ").title() if types else None
-
-        rating_val = result.get("rating")
-        rating_str = str(rating_val) if rating_val is not None else None
-
-        reviews_count = result.get("user_ratings_total")
-        reviews_str = str(reviews_count) if reviews_count is not None else None
-
-        return Business(
-            name=name,
-            phone=phone,
-            address=result.get("formatted_address"),
-            website=result.get("website"),
-            email=None,  # Places API no expone emails
-            search_query=search_query,
-            rating=rating_str,
-            reviews_count=reviews_str,
-            category=category,
-        )
