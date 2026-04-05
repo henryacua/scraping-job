@@ -99,7 +99,18 @@ Ejemplos:
         type=int,
         default=60,
         help=(
-            "Máximo de resultados: Playwright tope 60; Places API tope 140 (default: 60)"
+            "Máximo de resultados: Playwright tope 60; Places tope 140 por corrida "
+            "(Text Search pagina de a 20; Google suele ~60 por cadena). "
+            "Siguiente segmento: --places-page-token. Default: 60."
+        ),
+    )
+    parser.add_argument(
+        "--places-page-token",
+        type=str,
+        default=None,
+        help=(
+            "Solo places_api: nextPageToken del lote anterior para seguir la misma "
+            "búsqueda (misma --query)."
         ),
     )
     return parser.parse_args()
@@ -122,15 +133,25 @@ async def async_main(args: argparse.Namespace) -> None:
             logger.info("FASE 1: BUSQUEDA (Producer — %s)", args.source)
             logger.info("=" * 60)
 
+            ppt = (args.places_page_token or "").strip() or None
             producer = create_producer(
                 source=args.source,
                 session=session,
                 headless=not args.no_headless,
                 max_scroll_attempts=args.max_scroll_attempts,
                 max_results=args.max_results,
+                places_page_token=ppt,
             )
             count = await producer.run(args.query)
             logger.info("Busqueda finalizada: %d negocios extraidos", count)
+            if args.source == "places_api":
+                nxt = getattr(producer, "last_places_next_page_token", None)
+                if nxt:
+                    logger.info(
+                        "Places: hay mas paginas; siguiente lote con "
+                        "--places-page-token (token largo, ver ultima linea o job JSON)."
+                    )
+                    logger.info("PLACES_NEXT_PAGE_TOKEN=%s", nxt)
 
         if not args.scrape_only:
             logger.info("=" * 60)

@@ -32,6 +32,7 @@ def create_producer(
     max_scroll_attempts: int = 20,
     scroll_pause: float = 2.0,
     click_delay_ms: int = 2000,
+    places_page_token: str | None = None,
 ) -> MapsProducer:
     """Instancia el producer adecuado segun `source`."""
 
@@ -54,6 +55,7 @@ def create_producer(
         return PlacesApiProducer(
             session,
             max_results=max_results,
+            places_page_token=places_page_token,
             on_progress=on_progress,
         )
 

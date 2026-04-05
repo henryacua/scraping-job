@@ -53,16 +53,31 @@ class ScrapeRequest(BaseModel):
         ge=1,
         le=140,
         description=(
-            "Cuántos negocios como máximo traer. Playwright: tope 60. Places API: tope 140 "
-            "(paginación interna ~20 por llamada)."
+            "Cuántos negocios como máximo traer en esta corrida. Playwright: tope 60. "
+            "Places: tope 140 por petición al backend; Text Search usa páginas de hasta 20 "
+            "y Google suele devolver como mucho ~60 por cadena de paginación — para más, "
+            "otro lote con places_page_token (misma query)."
         ),
     )
     headless: bool = True
+    places_page_token: str | None = Field(
+        default=None,
+        description=(
+            "Solo places_api: token nextPageToken devuelto por un job anterior para traer "
+            "el siguiente lote (misma query). Ignorado con playwright."
+        ),
+    )
 
     @model_validator(mode="after")
     def clamp_max_results_by_source(self):
         if self.source == "playwright" and self.max_results > 60:
             return self.model_copy(update={"max_results": 60})
+        return self
+
+    @model_validator(mode="after")
+    def drop_places_token_for_playwright(self):
+        if self.source == "playwright" and self.places_page_token:
+            return self.model_copy(update={"places_page_token": None})
         return self
 
 
@@ -99,14 +114,20 @@ async def _run_scrape(job_id: str, req: ScrapeRequest) -> None:
                 headless=req.headless,
                 max_scroll_attempts=req.max_scroll_attempts,
                 max_results=req.max_results,
+                places_page_token=req.places_page_token,
             )
             count = await producer.run(req.query)
 
-        _jobs[job_id].update({
+        done: dict = {
             "status": "completed",
             "businesses_found": count,
             "finished_at": datetime.now(timezone.utc).isoformat(),
-        })
+        }
+        if req.source == "places_api":
+            tok = getattr(producer, "last_places_next_page_token", None)
+            if tok:
+                done["places_next_page_token"] = tok
+        _jobs[job_id].update(done)
         logger.info("Job %s completado: %d negocios encontrados", job_id, count)
     except Exception as exc:
         _jobs[job_id].update({

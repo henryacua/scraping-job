@@ -38,6 +38,7 @@ from backend.app import crud
 from backend.app.models import Business, BusinessStatus
 from backend.app.services.campaign import WhatsAppCloudAPI
 from backend.app.services.utils import normalize_phone
+from backend.app.services.places_producer import TEXT_SEARCH_TYPICAL_MAX_PER_CHAIN
 from backend.app.services.strategies import AVAILABLE_STRATEGIES, get_strategy, get_all_strategies
 
 
@@ -115,6 +116,38 @@ async def _get_message_logs():
 async def _delete_by_query(search_query):
     async with AsyncSession(engine) as session:
         return await crud.delete_by_query(session, search_query)
+
+
+_PLACES_LOTE_CHAIN_KEY = "places_lote_chain"
+
+
+def _places_token_for_lote(search_query: str, batch: int) -> str | None:
+    """Token de Google para iniciar este lote (lote 1 = None)."""
+    if batch <= 1:
+        return None
+    q = search_query.strip()
+    inner = (st.session_state.get(_PLACES_LOTE_CHAIN_KEY) or {}).get(q) or {}
+    return inner.get(batch)
+
+
+def _places_reset_lote_chain(search_query: str) -> None:
+    q = search_query.strip()
+    chain = st.session_state.setdefault(_PLACES_LOTE_CHAIN_KEY, {})
+    chain[q] = {}
+
+
+def _places_record_next_lote(
+    search_query: str, batch: int, next_tok: str | None
+) -> None:
+    q = search_query.strip()
+    chain = st.session_state.setdefault(_PLACES_LOTE_CHAIN_KEY, {})
+    inner = chain.setdefault(q, {})
+    if next_tok:
+        inner[batch + 1] = next_tok
+    else:
+        for k in list(inner.keys()):
+            if k > batch:
+                del inner[k]
 
 
 async def _log_message(bid, status, tmpl):
@@ -334,6 +367,7 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("## 📊 Opciones")
 
+    places_batch = 1
     if maps_source == "playwright":
         headless = st.checkbox("🖥️ Modo Headless", value=True)
         max_scroll_attempts = st.slider(
@@ -365,13 +399,39 @@ with st.sidebar:
             max_value=140,
             value=20,
             help=(
-                "Hasta 140 lugares: la API devuelve ~20 por página; el backend sigue el "
-                "nextPageToken (~2 s entre páginas). Luego, 1 Place Details por sitio."
+                "Cuántos negocios pedir **en esta corrida**. La API solo devuelve hasta **20** "
+                "por llamada de Text Search; el backend encadena varias llamadas si hace falta "
+                "(p. ej. 80 ≈ 4 páginas de búsqueda + 80 llamadas Place Details). "
+                f"Google suele cortar ~{TEXT_SEARCH_TYPICAL_MAX_PER_CHAIN} por cadena: "
+                "para seguir, sube el **lote** abajo (misma búsqueda)."
             ),
         )
+        if max_results > TEXT_SEARCH_TYPICAL_MAX_PER_CHAIN:
+            st.caption(
+                f"Nota: por encima de ~{TEXT_SEARCH_TYPICAL_MAX_PER_CHAIN} resultados Google "
+                "a menudo no pagina más en la misma cadena; si ves pocos sitios, usa **lote 2+**."
+            )
+        places_batch = st.slider(
+            "📦 Lote (1–5)",
+            min_value=1,
+            max_value=5,
+            value=1,
+            help=(
+                "**Continuación en el orden de Google**, no “mitad de un bloque” arbitrario: "
+                "lote 1 consume hasta N resultados y guarda un token; lote 2 pide los **siguientes** "
+                "N con la **misma** búsqueda (p. ej. lote 1 con 80 y lote 2 con 80 ≈ posiciones "
+                "81–160 si la API sigue devolviendo páginas). Lotes 2+ no borran lo ya guardado."
+            ),
+        )
+        _qk = search_query.strip()
+        _ready = (st.session_state.get(_PLACES_LOTE_CHAIN_KEY) or {}).get(_qk) or {}
+        if places_batch > 1 and places_batch not in _ready:
+            st.caption(
+                "⚠️ Ejecuta primero el lote anterior (misma búsqueda) para habilitar este lote."
+            )
         st.caption(
-            "Aquí no hay scroll del mapa: es **paginación** de la API + **Place Details** "
-            "(1 llamada por negocio para teléfono, web, etc.)."
+            "Cada negocio requiere Place Details además de Text Search. "
+            "Revisa el log de la búsqueda si hay muchos sitios en lista pero pocos encolados."
         )
 
     st.markdown("---")
@@ -385,6 +445,24 @@ with st.sidebar:
 # ── Acciones: modo remoto (Render API) ───────────────────
 
 def action_scrape_remote():
+    if maps_source == "places_api":
+        if places_batch > 1:
+            pt = _places_token_for_lote(search_query, places_batch)
+            if not pt:
+                st.error(
+                    "No hay cadena de paginación para este lote. Ejecuta el lote 1, luego 2, "
+                    "etc., con la misma búsqueda."
+                )
+                return
+        else:
+            _places_reset_lote_chain(search_query)
+
+    places_page_token = (
+        _places_token_for_lote(search_query, places_batch)
+        if maps_source == "places_api"
+        else None
+    )
+
     try:
         scrape_body: dict = {
             "query": search_query,
@@ -394,6 +472,8 @@ def action_scrape_remote():
         }
         if maps_source == "playwright":
             scrape_body["max_scroll_attempts"] = max_scroll_attempts
+        if maps_source == "places_api" and places_page_token:
+            scrape_body["places_page_token"] = places_page_token
         resp = _requests.post(
             f"{settings.RENDER_API_URL}/scrape",
             json=scrape_body,
@@ -426,6 +506,10 @@ def action_scrape_remote():
             count = result.get("businesses_found", "?")
             status_widget.update(label=f"Scraping completado: {count} negocios", state="complete")
             st.success(f"Se encontraron **{count}** negocios para *\"{search_query}\"*")
+            if maps_source == "places_api":
+                _places_record_next_lote(
+                    search_query, places_batch, result.get("places_next_page_token")
+                )
             st.rerun()
         else:
             status_widget.update(label="Error en scraping", state="error")
@@ -469,8 +553,27 @@ def action_process_remote():
 def action_scrape_local():
     from backend.app.services.producer import create_producer
 
+    if maps_source == "places_api":
+        if places_batch > 1:
+            pt = _places_token_for_lote(search_query, places_batch)
+            if not pt:
+                st.error(
+                    "No hay cadena de paginación para este lote. Ejecuta el lote 1, luego 2, "
+                    "etc., con la misma búsqueda."
+                )
+                return
+        else:
+            _places_reset_lote_chain(search_query)
+
+    places_page_token = (
+        _places_token_for_lote(search_query, places_batch)
+        if maps_source == "places_api"
+        else None
+    )
+
     existing = run_async(_get_all_businesses(search_query))
-    if existing:
+    skip_delete = maps_source == "places_api" and places_batch > 1
+    if existing and not skip_delete:
         run_async(_delete_by_query(search_query))
 
     log_container = st.empty()
@@ -492,12 +595,17 @@ def action_scrape_local():
                     headless=headless,
                     max_scroll_attempts=max_scroll_attempts,
                     max_results=max_results,
+                    places_page_token=places_page_token,
                 )
-                return await producer.run(search_query)
+                cnt = await producer.run(search_query)
+                nxt = getattr(producer, "last_places_next_page_token", None)
+                return cnt, nxt
 
-        count = run_async(_do_scrape())
+        count, next_places_tok = run_async(_do_scrape())
         progress_bar.progress(100, text=f"✅ {count} negocios encontrados")
         st.success(f"Busqueda completada: **{count}** negocios para *\"{search_query}\"*")
+        if maps_source == "places_api":
+            _places_record_next_lote(search_query, places_batch, next_places_tok)
         st.rerun()
     except Exception as exc:
         progress_bar.progress(0, text="❌ Error")
